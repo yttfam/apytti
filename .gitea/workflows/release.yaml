@@ -15,6 +15,13 @@ jobs:
           TAG="${GITHUB_REF##*/}"
           git clone --branch "$TAG" --depth 1 https://git.calii.net/cali/apytti.git src
 
+      - name: Install cross targets and toolchains
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add x86_64-pc-windows-gnu
+          which x86_64-linux-musl-gcc || brew install filosottile/musl-cross/musl-cross
+          which x86_64-w64-mingw32-gcc || brew install mingw-w64
+
       - name: Build macOS arm64
         working-directory: src
         run: cargo build --release
@@ -26,6 +33,13 @@ jobs:
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: ./sign.sh /Users/cali/Developer/perso/ttyfam/target/release/apytti
 
+      - name: Build, sign, notarize, staple .pkg
+        working-directory: src
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: ./build-pkg.sh /Users/cali/Developer/perso/ttyfam/target/release/apytti
+
       - name: Build Linux x86_64 (musl static)
         working-directory: src
         run: cargo build --release --target x86_64-unknown-linux-musl
@@ -35,14 +49,17 @@ jobs:
         run: cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Stage release artifacts
+        working-directory: src
         run: |
           mkdir -p release
           cp /Users/cali/Developer/perso/ttyfam/target/release/apytti release/apytti-macos-arm64
+          cp apytti-*.pkg release/
           cp /Users/cali/Developer/perso/ttyfam/target/x86_64-unknown-linux-musl/release/apytti release/apytti-linux-x86_64
           cp /Users/cali/Developer/perso/ttyfam/target/x86_64-pc-windows-gnu/release/apytti.exe release/apytti-windows-x86_64.exe
           ls -lh release/
 
       - name: Create Gitea release with binaries
+        working-directory: src
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

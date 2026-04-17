@@ -16,6 +16,31 @@ jobs:
           git clone --depth 1 --branch "${GITHUB_REF##*/}" https://git.calii.net/cali/apytti.git src
           cd src && git checkout "$GITHUB_SHA" || true
 
+      - name: Detect platform
+        id: platform
+        run: |
+          uname -a
+          rustup show
+
+      - name: Install cross targets
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Install platform deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          if command -v apt-get >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools mingw-w64
+          fi
+
+      - name: Install platform deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          which x86_64-linux-musl-gcc || brew install filosottile/musl-cross/musl-cross
+          which x86_64-w64-mingw32-gcc || brew install mingw-w64
+
       - name: Build
         working-directory: src
         run: cargo build
@@ -24,7 +49,7 @@ jobs:
         working-directory: src
         run: cargo test
 
-      - name: Build release (smoke)
+      - name: Build release native
         working-directory: src
         run: cargo build --release
 
