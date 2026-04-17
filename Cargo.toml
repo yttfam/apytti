@@ -1,0 +1,31 @@
+[package]
+name = "apytti"
+version = "0.2.0"
+edition = "2024"
+
+[lib]
+name = "apytti"
+path = "src/lib.rs"
+
+[[bin]]
+name = "apytti"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+dialoguer = { version = "0.11", default-features = false }
+dirs = "5"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

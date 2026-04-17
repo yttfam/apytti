@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apytti API</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; background: #fafafa; line-height: 1.6; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  h1 small { font-weight: normal; color: #666; font-size: 0.9rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 0.3rem; }
+  .method { display: inline-block; font-weight: bold; font-size: 0.85rem; padding: 0.15rem 0.5rem; border-radius: 3px; margin-right: 0.5rem; }
+  .post { background: #49cc90; color: #fff; }
+  .get { background: #61affe; color: #fff; }
+  code { background: #e8e8e8; padding: 0.15rem 0.35rem; border-radius: 3px; font-size: 0.9em; }
+  pre { background: #2d2d2d; color: #f8f8f2; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; line-height: 1.5; }
+  table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+  th, td { text-align: left; padding: 0.4rem 0.75rem; border-bottom: 1px solid #ddd; font-size: 0.9rem; vertical-align: top; }
+  th { font-weight: 600; }
+  .required { color: #e53e3e; font-size: 0.8rem; }
+  .optional { color: #888; font-size: 0.8rem; }
+  .backends { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0; }
+  .badge { background: #e8e8e8; padding: 0.2rem 0.6rem; border-radius: 12px; font-size: 0.8rem; font-family: monospace; }
+  footer { margin-top: 3rem; color: #999; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+
+<h1>apytti <small>multi-backend AI CLI gateway</small></h1>
+
+<div class="backends">
+  <span class="badge">claude</span>
+  <span class="badge">copilot</span>
+  <span class="badge">gemini</span>
+  <span class="badge">ollama</span>
+</div>
+
+<h2><span class="method post">POST</span> /api/ask</h2>
+<p>Send a prompt to the active backend (or override per request). Pass <code>session_id</code> from a previous response to continue a conversation.</p>
+
+<h3>Request</h3>
+<table>
+  <tr><th>Field</th><th>Type</th><th></th><th>Description</th></tr>
+  <tr><td><code>prompt</code></td><td>string</td><td><span class="required">required</span></td><td>The prompt to send</td></tr>
+  <tr><td><code>backend</code></td><td>string</td><td><span class="optional">optional</span></td><td>One of: <code>claude</code>, <code>copilot</code>, <code>gemini</code>, <code>ollama</code>. Defaults to active backend.</td></tr>
+  <tr><td><code>session_id</code></td><td>string</td><td><span class="optional">optional</span></td><td>Session ID to resume</td></tr>
+  <tr><td><code>model</code></td><td>string</td><td><span class="optional">optional</span></td><td>Model override</td></tr>
+  <tr><td><code>effort</code></td><td>string</td><td><span class="optional">optional</span></td><td>Effort level (Claude/Copilot only)</td></tr>
+</table>
+
+<pre>{
+  "prompt": "translate hello world to french",
+  "backend": "ollama",
+  "model": "llama3.2"
+}</pre>
+
+<h3>Response</h3>
+<table>
+  <tr><th>Field</th><th>Type</th><th>Description</th></tr>
+  <tr><td><code>response</code></td><td>string</td><td>The model's response</td></tr>
+  <tr><td><code>session_id</code></td><td>string</td><td>Session ID (pass back to continue)</td></tr>
+  <tr><td><code>cost_usd</code></td><td>number?</td><td>Estimated cost (null when not applicable, e.g. subscription/local)</td></tr>
+  <tr><td><code>backend</code></td><td>string</td><td>Backend that handled the request</td></tr>
+  <tr><td><code>error</code></td><td>string?</td><td>Error message if something went wrong</td></tr>
+</table>
+
+<pre>{
+  "response": "\"Hello world\" in French is \"Bonjour le monde\".",
+  "session_id": "7bb1d5fb-1fe1-41d8-abf7-1d0e730eefb6",
+  "cost_usd": null,
+  "backend": "ollama",
+  "error": null
+}</pre>
+
+<h2><span class="method get">GET</span> /health</h2>
+<pre>{
+  "status": "ok",
+  "version": "0.2.0",
+  "active_backend": "claude",
+  "enabled_backends": ["claude", "ollama"]
+}</pre>
+
+<h2>Configuration</h2>
+<p>Backends are configured in <code>~/.apytti/config.toml</code>. Run <code>apytti setup</code> for an interactive menu.</p>
+<pre>active = "claude"
+
+[backends.claude]
+enabled = true
+model = "sonnet"
+effort = "low"
+skip_permissions = true
+
+[backends.ollama]
+enabled = true
+endpoint = "http://localhost:11434"
+model = "llama3.2"</pre>
+
+<h2>Session flow</h2>
+<ol>
+  <li>POST without <code>session_id</code> → backend creates one</li>
+  <li>Response includes <code>session_id</code></li>
+  <li>Pass it back in next request to continue</li>
+</ol>
+<p>Sessions for Claude/Copilot/Gemini are managed by their respective CLIs. Ollama sessions are kept in apytti's memory (lost on restart).</p>
+
+<footer>apytti — part of the YTT family</footer>
+</body>
+</html>

@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.log
+inbox/.read/
+.env
+.env.local
+resume.sh

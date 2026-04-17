@@ -1,0 +1,5 @@
+[build]
+target-dir = "/Users/cali/Developer/perso/ttyfam/target"
+
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
