@@ -10,19 +10,28 @@ jobs:
   test:
     runs-on: macos-arm64
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        run: |
+          rm -rf src
+          git clone --depth 1 --branch "${GITHUB_REF##*/}" https://git.calii.net/cali/apytti.git src
+          cd src && git checkout "$GITHUB_SHA" || true
 
       - name: Build
+        working-directory: src
         run: cargo build
 
       - name: Test
+        working-directory: src
         run: cargo test
 
       - name: Build release (smoke)
+        working-directory: src
         run: cargo build --release
 
       - name: Cross-compile Linux x86_64
+        working-directory: src
         run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Cross-compile Windows x86_64
+        working-directory: src
         run: cargo build --release --target x86_64-pc-windows-gnu
