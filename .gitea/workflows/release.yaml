@@ -9,6 +9,15 @@ jobs:
   build-and-release:
     runs-on: macos-arm64
     steps:
+      - name: Verify runner is macOS
+        run: |
+          if [[ "$(uname)" != "Darwin" ]]; then
+            echo "fatal: release workflow must run on macOS (got $(uname))"
+            echo "Speedwagon-rs needs a label like 'darwin-arm64' that giorno-rs doesn't advertise."
+            exit 1
+          fi
+          uname -a
+
       - name: Checkout
         run: |
           rm -rf src
@@ -19,8 +28,8 @@ jobs:
         run: |
           rustup target add x86_64-unknown-linux-musl
           rustup target add x86_64-pc-windows-gnu
-          which x86_64-linux-musl-gcc || brew install filosottile/musl-cross/musl-cross
-          which x86_64-w64-mingw32-gcc || brew install mingw-w64
+          which x86_64-linux-musl-gcc || brew install filosottile/musl-cross/musl-cross || true
+          which x86_64-w64-mingw32-gcc || brew install mingw-w64 || true
 
       - name: Build macOS arm64
         working-directory: src
@@ -31,14 +40,14 @@ jobs:
         env:
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
-        run: ./sign.sh /Users/cali/Developer/perso/ttyfam/target/release/apytti
+        run: ./sign.sh target/release/apytti
 
       - name: Build, sign, notarize, staple .pkg
         working-directory: src
         env:
           VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
           VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
-        run: ./build-pkg.sh /Users/cali/Developer/perso/ttyfam/target/release/apytti
+        run: ./build-pkg.sh target/release/apytti
 
       - name: Build Linux x86_64 (musl static)
         working-directory: src
@@ -52,10 +61,10 @@ jobs:
         working-directory: src
         run: |
           mkdir -p release
-          cp /Users/cali/Developer/perso/ttyfam/target/release/apytti release/apytti-macos-arm64
+          cp target/release/apytti release/apytti-macos-arm64
           cp apytti-*.pkg release/
-          cp /Users/cali/Developer/perso/ttyfam/target/x86_64-unknown-linux-musl/release/apytti release/apytti-linux-x86_64
-          cp /Users/cali/Developer/perso/ttyfam/target/x86_64-pc-windows-gnu/release/apytti.exe release/apytti-windows-x86_64.exe
+          cp target/x86_64-unknown-linux-musl/release/apytti release/apytti-linux-x86_64
+          cp target/x86_64-pc-windows-gnu/release/apytti.exe release/apytti-windows-x86_64.exe
           ls -lh release/
 
       - name: Create Gitea release with binaries

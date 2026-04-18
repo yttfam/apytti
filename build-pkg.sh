@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-BINARY="${1:-/Users/cali/Developer/perso/ttyfam/target/release/apytti}"
+BINARY="${1:-target/release/apytti}"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 IDENTIFIER="net.calii.apytti"
 PKG_OUT="apytti-${VERSION}-arm64.pkg"

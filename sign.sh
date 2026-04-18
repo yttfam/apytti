@@ -9,7 +9,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-BINARY="${1:-/Users/cali/Developer/perso/ttyfam/target/release/apytti}"
+BINARY="${1:-target/release/apytti}"
 IDENTIFIER="net.calii.apytti"
 ENTITLEMENTS="$(pwd)/entitlements.plist"
 WORKDIR="$(mktemp -d)"
