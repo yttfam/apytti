@@ -9,27 +9,22 @@ jobs:
   build-and-release:
     runs-on: macos-arm64
     steps:
-      - name: Verify runner is macOS
-        run: |
-          if [[ "$(uname)" != "Darwin" ]]; then
-            echo "fatal: release workflow must run on macOS (got $(uname))"
-            echo "Speedwagon-rs needs a label like 'darwin-arm64' that giorno-rs doesn't advertise."
-            exit 1
-          fi
-          uname -a
-
       - name: Checkout
         run: |
           rm -rf src
           TAG="${GITHUB_REF##*/}"
           git clone --branch "$TAG" --depth 1 https://git.calii.net/cali/apytti.git src
 
-      - name: Install cross targets and toolchains
+      - name: Verify build prerequisites
         run: |
           rustup target add x86_64-unknown-linux-musl
           rustup target add x86_64-pc-windows-gnu
-          which x86_64-linux-musl-gcc || brew install filosottile/musl-cross/musl-cross || true
-          which x86_64-w64-mingw32-gcc || brew install mingw-w64 || true
+          for tool in x86_64-linux-musl-gcc x86_64-w64-mingw32-gcc codesign productsign pkgbuild xcrun jq; do
+            if ! command -v "$tool" >/dev/null; then
+              echo "fatal: $tool not found on this runner"
+              exit 1
+            fi
+          done
 
       - name: Build macOS arm64
         working-directory: src
@@ -37,16 +32,10 @@ jobs:
 
       - name: Sign and notarize macOS binary
         working-directory: src
-        env:
-          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
-          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: ./sign.sh target/release/apytti
 
       - name: Build, sign, notarize, staple .pkg
         working-directory: src
-        env:
-          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
-          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
         run: ./build-pkg.sh target/release/apytti
 
       - name: Build Linux x86_64 (musl static)
@@ -69,10 +58,12 @@ jobs:
 
       - name: Create Gitea release with binaries
         working-directory: src
-        env:
-          TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -euo pipefail
+          if [[ -z "${RELEASE_TOKEN:-}" ]]; then
+            echo "fatal: RELEASE_TOKEN not set. Add as repo secret in Gitea."
+            exit 1
+          fi
           TAG="${GITHUB_REF##*/}"
           REPO_FULL="${GITHUB_REPOSITORY:-cali/apytti}"
           API="https://git.calii.net/api/v1"
@@ -81,7 +72,7 @@ jobs:
 
           BODY=$(printf '{"tag_name":"%s","name":"%s","body":"Automated release","draft":false,"prerelease":false}' "$TAG" "$TAG")
           RESPONSE=$(curl -fsS -X POST "$API/repos/$REPO_FULL/releases" \
-            -H "Authorization: token $TOKEN" \
+            -H "Authorization: token $RELEASE_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$BODY")
 
@@ -92,7 +83,7 @@ jobs:
             name=$(basename "$f")
             echo "Uploading $name"
             curl -fsS -X POST "$API/repos/$REPO_FULL/releases/$RELEASE_ID/assets?name=$name" \
-              -H "Authorization: token $TOKEN" \
+              -H "Authorization: token $RELEASE_TOKEN" \
               -H "Content-Type: application/octet-stream" \
               --data-binary "@$f"
           done
