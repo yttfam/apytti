@@ -14,6 +14,12 @@ fn main() -> anyhow::Result<()> {
     // registration + Local Network Privacy. Tokio runs on a worker for daemon mode;
     // for one-shot commands we build a runtime locally and block on it.
 
+    // GUI launches (Finder, `open -a /Applications/Apytti.app`) inherit a minimal
+    // PATH from LaunchServices that doesn't include /opt/homebrew/bin or
+    // /usr/local/bin where `claude`, `copilot`, `gemini` typically live. Augment
+    // the process PATH so spawned subprocesses can find them.
+    augment_path();
+
     // Strip Finder-launched -psn_X_Y arg before clap parses argv
     let args: Vec<String> = std::env::args()
         .filter(|a| !a.starts_with("-psn_"))
@@ -39,6 +45,35 @@ fn main() -> anyhow::Result<()> {
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     rt.block_on(f)
+}
+
+/// Prepend common shell-install dirs to $PATH if they're not already on it.
+/// Necessary on macOS where Finder/LaunchServices launches inherit a stripped
+/// PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) that doesn't include /opt/homebrew/bin
+/// or /usr/local/bin — which is where claude, copilot, gemini live after npm/brew.
+fn augment_path() {
+    let extras = [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ];
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let current_str = current.to_string_lossy().into_owned();
+    let mut prepend = Vec::new();
+    for dir in extras {
+        if !current_str.split(':').any(|p| p == dir) {
+            prepend.push(dir);
+        }
+    }
+    if prepend.is_empty() {
+        return;
+    }
+    let new_path = format!("{}:{current_str}", prepend.join(":"));
+    // SAFETY: single-threaded at startup; no other thread reads/writes env yet.
+    unsafe {
+        std::env::set_var("PATH", new_path);
+    }
 }
 
 async fn init_models(config_path: PathBuf) -> anyhow::Result<()> {

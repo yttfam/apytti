@@ -41,7 +41,15 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
         cmd.arg("--dangerously-skip-permissions");
     }
 
+    if let Some(agent) = req.agent.as_deref() {
+        cmd.arg("--agent").arg(agent);
+    }
+
     for rule in &cfg.allow {
+        cmd.arg("--allowedTools").arg(rule);
+    }
+
+    for rule in &req.extra_allow {
         cmd.arg("--allowedTools").arg(rule);
     }
 

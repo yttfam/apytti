@@ -18,6 +18,18 @@ pub struct PersistedConfig {
     /// Hermytt registry settings (optional). If absent, registry announce is skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hermytt: Option<HermyttConfig>,
+
+    /// Security gates (optional). Currently scoped to `attachment_roots`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Whitelist of roots for `attachments[].path` on `/api/ask`. If empty or
+    /// unset, no whitelist enforcement (only existence/regular-file checks).
+    #[serde(default)]
+    pub attachment_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -115,6 +127,9 @@ impl PersistedConfig {
         if other.hermytt.is_some() {
             self.hermytt = other.hermytt;
         }
+        if other.security.is_some() {
+            self.security = other.security;
+        }
     }
 }
 
@@ -137,6 +152,7 @@ mod tests {
             active: Some(BackendKind::Claude),
             backends: HashMap::new(),
             hermytt: None,
+            security: None,
         };
         cfg.set_backend(
             BackendKind::Claude,

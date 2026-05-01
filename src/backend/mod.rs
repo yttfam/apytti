@@ -64,6 +64,13 @@ pub struct AskRequest {
     /// Claude/Copilot/Gemini scope sessions to the cwd they were started in.
     /// Ignored by Ollama (it's HTTP, no cwd semantics).
     pub dir: Option<String>,
+    /// Per-request agent override (Claude only). Maps to `claude --agent <name>`.
+    /// Ignored by other backends.
+    pub agent: Option<String>,
+    /// Per-call extra `--allowedTools` rules. Used today for attachment Read()
+    /// rules so the bridge doesn't have to set `skip_permissions` globally.
+    /// Scoped to this single invocation; never persisted.
+    pub extra_allow: Vec<String>,
 }
 
 /// Unified response shape.

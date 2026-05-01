@@ -11,8 +11,10 @@ use axum::extract::Path;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::stream::Stream;
 
+use crate::attachments::{self, Attachment};
 use crate::backend::{dispatch, dispatch_stream, AskRequest, BackendKind};
 use crate::error::AppError;
+use crate::customizations;
 use crate::models::{self, ModelsCache};
 use crate::persist::PersistedConfig;
 use crate::schema;
@@ -72,6 +74,21 @@ pub struct AskRequestBody {
     /// Per-request working directory override. Combines with `session_id` to
     /// resume sessions in different project directories from a single apytti.
     pub dir: Option<String>,
+    /// Per-request claude agent override. Maps to `claude --agent <name>`.
+    pub agent: Option<String>,
+    /// Optional file attachments. Each `path` must be absolute and exist on
+    /// the apytti host's filesystem. Apytti prepends a reference line per
+    /// attachment to the prompt and (for the claude CLI backend) mints a
+    /// per-call `Read(<path>)` allow rule so reads succeed without
+    /// `--dangerously-skip-permissions`. When `[security] attachment_roots`
+    /// is set in config, paths must live inside one of those roots.
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+    /// If set, apytti reads `~/.claude/commands/<command>.md`, substitutes
+    /// `$ARGUMENTS` with `prompt`, and submits the expanded text as the
+    /// actual prompt. Slash-style command templating without needing claude's
+    /// TUI to be running.
+    pub command: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -92,8 +109,22 @@ pub async fn ask(
         return Err(AppError::BadRequest("prompt is required".into()));
     }
 
+    // If `command` is set, expand the template (substituting $ARGUMENTS with
+    // body.prompt) and use the expanded text as the actual prompt.
+    let mut effective_prompt = body.prompt;
+    if let Some(cmd_name) = &body.command {
+        match customizations::expand_command(cmd_name, &effective_prompt) {
+            Ok(expanded) => effective_prompt = expanded,
+            Err(e) => {
+                return Err(AppError::BadRequest(format!(
+                    "command expansion failed: {e}"
+                )));
+            }
+        }
+    }
+
     // Snapshot config once per call so the rest of the handler doesn't hold the lock across await.
-    let (kind, cfg) = {
+    let (kind, cfg, attachment_roots) = {
         let snapshot = state.config.read().await;
         let kind = resolve_backend(&snapshot, body.backend.as_deref())?;
         let cfg = snapshot.backend(kind);
@@ -102,26 +133,46 @@ pub async fn ask(
                 "backend {kind} is not enabled. Run `apytti setup` to configure it.",
             )));
         }
-        (kind, cfg)
+        let roots = snapshot
+            .security
+            .as_ref()
+            .map(|s| s.attachment_roots.clone())
+            .unwrap_or_default();
+        (kind, cfg, roots)
     };
 
-    let prompt_preview: String = body.prompt.chars().take(100).collect();
+    // Validate every attachment up front; bail with a clean 400 on any failure.
+    for att in &body.attachments {
+        attachments::validate(att, &attachment_roots)
+            .map_err(AppError::BadRequest)?;
+    }
+    if !body.attachments.is_empty() {
+        let prefix = attachments::prompt_prefix(&body.attachments);
+        effective_prompt = format!("{prefix}{effective_prompt}");
+    }
+    let extra_allow = attachments::allow_rules(&body.attachments);
+
+    let prompt_preview: String = effective_prompt.chars().take(100).collect();
     info!(
         backend = kind.as_str(),
         session_id = body.session_id.as_deref().unwrap_or("-"),
         model = body.model.as_deref().unwrap_or("-"),
         effort = body.effort.as_deref().unwrap_or("-"),
+        agent = body.agent.as_deref().unwrap_or("-"),
+        command = body.command.as_deref().unwrap_or("-"),
         stream = body.stream,
         "ask: {prompt_preview}{}",
-        if body.prompt.len() > 100 { "..." } else { "" }
+        if effective_prompt.len() > 100 { "..." } else { "" }
     );
 
     let req = AskRequest {
-        prompt: body.prompt,
+        prompt: effective_prompt,
         session_id: body.session_id,
         model: body.model,
         effort: body.effort,
         dir: body.dir,
+        agent: body.agent,
+        extra_allow,
     };
 
     // Acquire per-(backend, dir, sid) mutex if a session_id is set — serializes
@@ -303,6 +354,173 @@ pub async fn get_backend_sessions(
         .ok_or_else(|| AppError::BadRequest(format!("unknown backend: {name}")))?;
     let sessions = sessions::list_sessions(kind, q.dir.as_deref());
     Ok(Json(serde_json::json!({"sessions": sessions})))
+}
+
+// ---------- MCP servers ----------
+
+/// GET /backends/claude/mcp — list registered MCP servers.
+pub async fn get_mcp_servers(
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if BackendKind::parse(&name) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(format!(
+            "MCP discovery only implemented for claude (got: {name})"
+        )));
+    }
+    let servers = customizations::list_mcp_servers();
+    Ok(Json(serde_json::json!({"servers": servers})))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AddMcpBody {
+    pub name: String,
+    /// "http" | "sse" | "stdio"
+    pub transport: String,
+    /// URL for http/sse, command for stdio
+    pub target: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub headers: Vec<String>,
+    /// "user" | "project" | "local". Defaults to user.
+    pub scope: Option<String>,
+}
+
+pub async fn post_mcp_server(
+    state: Arc<ServerState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<AddMcpBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_hermytt_key(&state, &headers).await?;
+    if BackendKind::parse(&name) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(format!(
+            "MCP add only implemented for claude (got: {name})"
+        )));
+    }
+    customizations::add_mcp_server(
+        &body.name,
+        &body.transport,
+        &body.target,
+        &body.args,
+        &body.headers,
+        body.scope.as_deref(),
+    )
+    .map_err(|e| AppError::BadRequest(format!("add failed: {e}")))?;
+    info!(mcp = body.name, "MCP server added");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+pub async fn delete_mcp_server(
+    state: Arc<ServerState>,
+    headers: HeaderMap,
+    Path((backend, server)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_hermytt_key(&state, &headers).await?;
+    if BackendKind::parse(&backend) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest("MCP only implemented for claude".into()));
+    }
+    customizations::remove_mcp_server(&server, None)
+        .map_err(|e| AppError::BadRequest(format!("remove failed: {e}")))?;
+    info!(mcp = server, "MCP server removed");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// ---------- Custom commands ----------
+
+pub async fn get_commands(Path(name): Path<String>) -> Result<Json<serde_json::Value>, AppError> {
+    if BackendKind::parse(&name) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(
+            "commands only implemented for claude".into(),
+        ));
+    }
+    let commands = customizations::list_commands();
+    Ok(Json(serde_json::json!({"commands": commands})))
+}
+
+pub async fn get_command(
+    Path((backend, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if BackendKind::parse(&backend) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(
+            "commands only implemented for claude".into(),
+        ));
+    }
+    let cmd = customizations::read_command(&name)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(serde_json::to_value(cmd).unwrap_or(serde_json::Value::Null)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CommandBody {
+    pub name: String,
+    pub body: String,
+}
+
+pub async fn post_command(
+    state: Arc<ServerState>,
+    headers: HeaderMap,
+    Path(backend): Path<String>,
+    Json(body): Json<CommandBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_hermytt_key(&state, &headers).await?;
+    if BackendKind::parse(&backend) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(
+            "commands only implemented for claude".into(),
+        ));
+    }
+    customizations::write_command(&body.name, &body.body)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    info!(command = body.name, "custom command written");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+pub async fn delete_command(
+    state: Arc<ServerState>,
+    headers: HeaderMap,
+    Path((backend, name)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_hermytt_key(&state, &headers).await?;
+    if BackendKind::parse(&backend) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(
+            "commands only implemented for claude".into(),
+        ));
+    }
+    let removed = customizations::delete_command(&name)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !removed {
+        return Err(AppError::BadRequest(format!("command not found: {name}")));
+    }
+    info!(command = name, "custom command deleted");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// ---------- Agents ----------
+
+pub async fn get_agents(Path(name): Path<String>) -> Result<Json<serde_json::Value>, AppError> {
+    if BackendKind::parse(&name) != Some(BackendKind::Claude) {
+        return Err(AppError::BadRequest(
+            "agents only implemented for claude".into(),
+        ));
+    }
+    let agents = customizations::list_agents();
+    Ok(Json(serde_json::json!({"agents": agents})))
+}
+
+/// Helper: gate write/delete endpoints on `X-Hermytt-Key` when `config_token` is set.
+async fn require_hermytt_key(state: &Arc<ServerState>, headers: &HeaderMap) -> Result<(), AppError> {
+    let snapshot = state.config.read().await;
+    if let Some(expected) = snapshot
+        .hermytt
+        .as_ref()
+        .and_then(|h| h.config_token.as_deref())
+    {
+        let provided = headers.get("x-hermytt-key").and_then(|v| v.to_str().ok());
+        if provided != Some(expected) {
+            return Err(AppError::BadRequest("unauthorized: invalid X-Hermytt-Key".into()));
+        }
+    }
+    Ok(())
 }
 
 /// GET /backends/{name}/sessions/{sid}/messages — full conversation log.

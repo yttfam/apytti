@@ -2,7 +2,7 @@
 
 Quick contract for every endpoint. Updated on every endpoint change. **For prose docs see README.md, for the in-binary HTML view hit `GET /help`.**
 
-Version: **0.5.0**
+Version: **0.6.0**
 Default port: **7781**
 Base URL: `http://<host>:<port>`
 
@@ -16,6 +16,10 @@ Base URL: `http://<host>:<port>`
 | `POST /models/init` | yes |
 | `DELETE /backends/{name}/sessions/{sid}` | yes |
 | `GET /backends/{name}/sessions/{sid}/messages` | yes |
+| `POST /backends/{name}/mcp` | yes |
+| `DELETE /backends/{name}/mcp/{server}` | yes |
+| `POST /backends/{name}/commands` | yes |
+| `DELETE /backends/{name}/commands/{cmd}` | yes |
 | Everything else | no |
 
 ---
@@ -33,9 +37,21 @@ Send a prompt to a backend.
   "model": "string",                          // optional, overrides default
   "effort": "low|medium|high|max",            // optional (claude/copilot only)
   "dir": "/path",                             // optional, per-request CWD override
-  "stream": false                             // optional, returns SSE if true
+  "stream": false,                            // optional, returns SSE if true
+  "agent": "infrakid",                        // optional (claude only) — passes --agent <name>
+  "command": "review",                        // optional (claude only) — expand ~/.claude/commands/review.md, $ARGUMENTS = prompt
+  "attachments": [                            // optional, file references on the apytti host's filesystem
+    { "path": "/abs/path/kitchen.jpg", "kind": "image", "name": "kitchen.jpg" },
+    { "path": "/abs/path/lease.pdf",   "kind": "document" }
+  ]
 }
 ```
+
+**Attachments**: each entry is `{path, kind?, name?}`. `path` is required, must be absolute, exist, and be a regular file. `kind` is one of `image | document | voice | video | audio` (defaults to extension-based inference). `name` is the original filename for display (defaults to basename).
+
+Apytti prepends a reference line per attachment to the prompt (`[attached <kind>: <name> -> <path>]`) and, for the claude CLI backend, mints a per-call `--allowedTools Read(<path>)` rule so the file is readable without `--dangerously-skip-permissions`. Per-call scope only — never persisted to `~/.apytti/config.toml`.
+
+**Security gate** (optional): set `[security] attachment_roots = ["/tmp/pyttch-bridge", ...]` in the persisted config to require every `attachments[].path` live inside one of those roots. Unset = no whitelist enforcement (existence/regular-file checks still apply).
 
 **Response (non-streaming)** — `application/json`:
 ```json
@@ -258,6 +274,99 @@ Full conversation as a flat ordered array. Backend-agnostic shape.
 Currently Claude only. Other backends return `messages: []`.
 
 Returns `400` if the session is not found.
+
+---
+
+## GET /backends/{name}/mcp
+
+List registered MCP servers for the backend (currently claude only). Shells out to `claude mcp list` and parses the result.
+
+```json
+{
+  "servers": [
+    { "name": "palazzo",  "transport": "http", "target": "http://10.10.0.3:6335/mcp", "scope": null },
+    { "name": "prompto",  "transport": "http", "target": "http://10.10.0.3:6337/mcp", "scope": null }
+  ]
+}
+```
+
+## POST /backends/{name}/mcp
+
+**Auth**: `X-Hermytt-Key` (when `config_token` set).
+
+Add an MCP server. Wraps `claude mcp add`.
+
+```json
+{
+  "name": "my-mcp",
+  "transport": "http",         // "http" | "sse" | "stdio"
+  "target": "https://example.com/mcp",   // URL for http/sse, command for stdio
+  "args": [],                  // stdio subprocess args
+  "headers": ["Authorization: Bearer xxx"],   // optional, http/sse only
+  "scope": "user"              // optional: "user" | "project" | "local"
+}
+```
+
+## DELETE /backends/{name}/mcp/{server}
+
+**Auth**: `X-Hermytt-Key` (when `config_token` set).
+
+Remove an MCP server. Wraps `claude mcp remove`.
+
+---
+
+## GET /backends/{name}/commands
+
+List custom slash-command templates (user-level + plugin-provided).
+
+```json
+{
+  "commands": [
+    { "name": "help", "scope": "plugin:ralph-wiggum", "path": "...", "body": null },
+    { "name": "review", "scope": "user", "path": "/Users/cali/.claude/commands/review.md", "body": null }
+  ]
+}
+```
+
+`body` is null in the listing (read each via `GET /backends/.../commands/{name}` to fetch the markdown).
+
+## GET /backends/{name}/commands/{cmd}
+
+Read a single command including its markdown body. Returns 400 if not found.
+
+## POST /backends/{name}/commands
+
+**Auth**: `X-Hermytt-Key` (when `config_token` set).
+
+Create a user-level command at `~/.claude/commands/{name}.md`.
+
+```json
+{ "name": "review", "body": "Review this code:\n\n$ARGUMENTS" }
+```
+
+`$ARGUMENTS` is the placeholder replaced with the request's `prompt` when invoked via `/api/ask` with `command: "review"`.
+
+## DELETE /backends/{name}/commands/{cmd}
+
+**Auth**: `X-Hermytt-Key` (when `config_token` set).
+
+Remove a user-level command. Plugin commands cannot be deleted (read-only).
+
+---
+
+## GET /backends/{name}/agents
+
+List user-defined and plugin-provided agents.
+
+```json
+{
+  "agents": [
+    { "name": "infrakid", "scope": "user", "path": "/Users/cali/.claude/agents/infrakid.md" }
+  ]
+}
+```
+
+Read-only — agent CRUD goes through the .md files directly. Pass `agent: "name"` in `/api/ask` to use one for that call.
 
 ---
 

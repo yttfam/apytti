@@ -1,5 +1,7 @@
+pub mod attachments;
 pub mod backend;
 pub mod config;
+pub mod customizations;
 mod error;
 pub mod handler;
 pub mod install;

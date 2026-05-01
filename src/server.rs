@@ -64,4 +64,42 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
                 }
             }),
         )
+        // MCP servers
+        .route("/backends/{name}/mcp", get(handler::get_mcp_servers))
+        .route(
+            "/backends/{name}/mcp",
+            post({
+                let state = state.clone();
+                move |headers, path, body| handler::post_mcp_server(state, headers, path, body)
+            }),
+        )
+        .route(
+            "/backends/{name}/mcp/{server}",
+            delete({
+                let state = state.clone();
+                move |headers, path| handler::delete_mcp_server(state, headers, path)
+            }),
+        )
+        // Custom commands
+        .route("/backends/{name}/commands", get(handler::get_commands))
+        .route(
+            "/backends/{name}/commands",
+            post({
+                let state = state.clone();
+                move |headers, path, body| handler::post_command(state, headers, path, body)
+            }),
+        )
+        .route(
+            "/backends/{name}/commands/{cmd}",
+            get(handler::get_command),
+        )
+        .route(
+            "/backends/{name}/commands/{cmd}",
+            delete({
+                let state = state.clone();
+                move |headers, path| handler::delete_command(state, headers, path)
+            }),
+        )
+        // Agents (read-only)
+        .route("/backends/{name}/agents", get(handler::get_agents))
 }
