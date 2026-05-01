@@ -14,6 +14,30 @@ pub struct PersistedConfig {
     /// Per-backend defaults.
     #[serde(default)]
     pub backends: HashMap<String, BackendConfig>,
+
+    /// Hermytt registry settings (optional). If absent, registry announce is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hermytt: Option<HermyttConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HermyttConfig {
+    /// Hermytt registry URL (e.g. http://mista:7777)
+    pub url: String,
+    /// Bearer-style auth token (sent as X-Hermytt-Key header)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Endpoint apytti advertises to hermytt. Defaults to http://<hostname>:<port>.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Service name announced to hermytt. Defaults to `apytti-<hostname>` so
+    /// multiple apytti instances on different hosts coexist in the registry
+    /// without stomping each other.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Token required for PUT /config (write protection). If absent, /config writes are open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_token: Option<String>,
 }
 
 /// Per-backend configuration. All fields optional; unused keys are silently ignored.
@@ -77,6 +101,21 @@ impl PersistedConfig {
     pub fn set_backend(&mut self, kind: BackendKind, cfg: BackendConfig) {
         self.backends.insert(kind.as_str().to_string(), cfg);
     }
+
+    /// Merge another config into this one. Used for partial PUT updates from hermytt.
+    /// `other.active` overrides if set. Each backend from `other.backends` replaces this side's
+    /// entry wholesale (not field-by-field). `hermytt` is replaced if `other.hermytt` is set.
+    pub fn merge(&mut self, other: PersistedConfig) {
+        if other.active.is_some() {
+            self.active = other.active;
+        }
+        for (k, v) in other.backends {
+            self.backends.insert(k, v);
+        }
+        if other.hermytt.is_some() {
+            self.hermytt = other.hermytt;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +136,7 @@ mod tests {
         let mut cfg = PersistedConfig {
             active: Some(BackendKind::Claude),
             backends: HashMap::new(),
+            hermytt: None,
         };
         cfg.set_backend(
             BackendKind::Claude,

@@ -33,6 +33,7 @@ SUBCOMMANDS:
   apytti setup            Interactive backend configuration menu
   apytti install          Install as OS daemon (launchd/systemd/sc)
   apytti uninstall        Remove the daemon
+  apytti status           Show daemon installation + running state
 
 CONFIG: ~/.apytti/config.toml";
 
@@ -62,9 +63,13 @@ pub enum Command {
     Install(InstallArgs),
     /// Remove the system daemon
     Uninstall,
+    /// Show daemon installation + running state
+    Status,
+    /// Probe each enabled backend for available models, save to ~/.apytti/models.json
+    InitModels,
 }
 
-#[derive(Parser, Debug, Clone, Default)]
+#[derive(Parser, Debug, Clone)]
 pub struct RunArgs {
     /// Listen port
     #[arg(long, default_value = "7781")]
@@ -81,6 +86,28 @@ pub struct RunArgs {
     /// Enable verbose logging (requests, responses, timing)
     #[arg(long)]
     pub verbose: bool,
+
+    /// macOS only: skip the NSApp menu-bar wrapper, run as a plain headless
+    /// server. Useful for dev/test from a terminal. Production daemons should
+    /// keep the menu wrapper so Local Network Privacy attribution works.
+    #[arg(long)]
+    pub no_menu: bool,
+}
+
+impl Default for RunArgs {
+    fn default() -> Self {
+        // Manual Default so the clap-attribute defaults (e.g. port=7781) are
+        // respected when constructing RunArgs without going through clap parsing
+        // (e.g. when no subcommand was given on the CLI). The derived Default
+        // would give port=0, which silently bound to an ephemeral port.
+        Self {
+            port: 7781,
+            host: None,
+            localhost: false,
+            verbose: false,
+            no_menu: false,
+        }
+    }
 }
 
 #[derive(Parser, Debug, Clone, Default)]
@@ -92,6 +119,20 @@ pub struct InstallArgs {
     /// Bind address for the daemon [default: 127.0.0.1]
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
+
+    /// Working directory for the daemon (Claude reads .claude/ from CWD).
+    /// Default: /var/lib/apytti (Linux) or /usr/local/var/apytti (macOS).
+    #[arg(long)]
+    pub dir: Option<String>,
+
+    /// Hermytt registry URL — bakes [hermytt] config into the daemon's environment
+    /// so it auto-announces on startup.
+    #[arg(long)]
+    pub hermytt_url: Option<String>,
+
+    /// Hermytt registry token (sent as X-Hermytt-Key header)
+    #[arg(long)]
+    pub hermytt_token: Option<String>,
 }
 
 impl RunArgs {

@@ -18,42 +18,48 @@ jobs:
       - name: Verify build prerequisites
         run: |
           rustup target add x86_64-unknown-linux-musl
-          rustup target add x86_64-pc-windows-gnu
-          for tool in x86_64-linux-musl-gcc x86_64-w64-mingw32-gcc codesign productsign pkgbuild xcrun jq; do
+          rustup target add aarch64-unknown-linux-musl
+          for tool in x86_64-linux-musl-gcc codesign productsign pkgbuild xcrun jq; do
             if ! command -v "$tool" >/dev/null; then
               echo "fatal: $tool not found on this runner"
               exit 1
             fi
           done
 
-      - name: Build macOS arm64
+      - name: Build macOS arm64 release binary
         working-directory: src
         run: cargo build --release
 
-      - name: Sign and notarize macOS binary
+      - name: Wrap in Apytti.app + signed/notarized/stapled .pkg
         working-directory: src
-        run: ./sign.sh target/release/apytti
-
-      - name: Build, sign, notarize, staple .pkg
-        working-directory: src
+        # build-pkg.sh: wraps target/release/apytti in Apytti.app/Contents/MacOS/,
+        # codesigns the bundle with Developer ID Application, builds a pkg that
+        # installs the .app to /Applications + symlinks /usr/local/bin/apytti,
+        # signs the pkg with Developer ID Installer, then notarizes + staples.
+        # All credentials sourced from Vault (secret/infra/apple-{asc,cert-...}).
         run: ./build-pkg.sh target/release/apytti
 
       - name: Build Linux x86_64 (musl static)
         working-directory: src
         run: cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: Build Windows x86_64
+      - name: Build Linux aarch64 (musl static)
         working-directory: src
-        run: cargo build --release --target x86_64-pc-windows-gnu
+        run: cargo build --release --target aarch64-unknown-linux-musl
 
       - name: Stage release artifacts
         working-directory: src
         run: |
           mkdir -p release
+          # macOS pkg (ships the .app + symlink)
+          cp target/apytti-*.pkg release/
+          # macOS arm64 raw binary (signed via the Makefile too)
           cp target/release/apytti release/apytti-macos-arm64
-          cp apytti-*.pkg release/
+          # Linux statics
           cp target/x86_64-unknown-linux-musl/release/apytti release/apytti-linux-x86_64
-          cp target/x86_64-pc-windows-gnu/release/apytti.exe release/apytti-windows-x86_64.exe
+          cp target/aarch64-unknown-linux-musl/release/apytti release/apytti-linux-aarch64
+          # Checksums
+          (cd release && shasum -a 256 * > SHA256SUMS)
           ls -lh release/
 
       - name: Create Gitea release with binaries
@@ -70,7 +76,7 @@ jobs:
 
           echo "Creating release $TAG for $REPO_FULL"
 
-          BODY=$(printf '{"tag_name":"%s","name":"%s","body":"Automated release","draft":false,"prerelease":false}' "$TAG" "$TAG")
+          BODY=$(printf '{"tag_name":"%s","name":"%s","body":"Automated release. macOS .pkg installs Apytti.app to /Applications and symlinks /usr/local/bin/apytti.","draft":false,"prerelease":false}' "$TAG" "$TAG")
           RESPONSE=$(curl -fsS -X POST "$API/repos/$REPO_FULL/releases" \
             -H "Authorization: token $RELEASE_TOKEN" \
             -H "Content-Type: application/json" \

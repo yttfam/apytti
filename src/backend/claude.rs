@@ -1,9 +1,12 @@
 use std::process::Stdio;
 
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use super::{AskRequest, Response};
 use crate::persist::BackendConfig;
+use crate::stream::StreamEvent;
 
 #[derive(Debug, serde::Deserialize)]
 struct RawResponse {
@@ -42,7 +45,9 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
         cmd.arg("--allowedTools").arg(rule);
     }
 
-    if let Some(ref dir) = cfg.dir {
+    // Per-request `dir` overrides the per-backend default. Sessions are scoped
+    // to the cwd, so this is required for multi-project resume.
+    if let Some(dir) = req.dir.as_deref().or(cfg.dir.as_deref()) {
         cmd.current_dir(dir);
     }
 
@@ -84,6 +89,110 @@ pub async fn ask(cfg: &BackendConfig, req: &AskRequest) -> anyhow::Result<Respon
         backend: String::new(),
         error,
     })
+}
+
+/// Streaming variant — emits Delta events as the assistant generates text.
+/// Returns the final Response (used by dispatch_stream to emit the Done event).
+///
+/// Claude's `--output-format stream-json` (with --verbose) emits JSONL of:
+///   - `{"type":"system","subtype":"init",...}` (skipped)
+///   - `{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}` (text chunks)
+///   - `{"type":"result","session_id":"...","total_cost_usd":...}` (terminal)
+///
+/// Each `assistant` event's text field is cumulative for that turn, so we track
+/// last-emitted length and emit only the suffix as a delta.
+pub async fn ask_stream(
+    cfg: &BackendConfig,
+    req: &AskRequest,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> anyhow::Result<Response> {
+    let mut cmd = build_command(cfg, req);
+    // Override output-format to stream-json. claude requires --verbose with stream-json.
+    cmd.arg("--output-format").arg("stream-json").arg("--verbose");
+
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("claude: stdout was not piped"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut session_id = None;
+    let mut cost_usd = None;
+    let mut full_text = String::new();
+    let mut emitted_len = 0usize;
+    let mut error_msg: Option<String> = None;
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                if let Some(content) = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        if let Some(text) = block
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .filter(|t| *t == "text")
+                            .and(block.get("text").and_then(|t| t.as_str()))
+                        {
+                            full_text = text.to_string();
+                            if full_text.len() > emitted_len {
+                                let delta = full_text[emitted_len..].to_string();
+                                emitted_len = full_text.len();
+                                if tx.send(StreamEvent::Delta { text: delta }).await.is_err() {
+                                    return Ok(final_response(full_text, session_id, cost_usd, error_msg));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                session_id = v.get("session_id").and_then(|s| s.as_str()).map(String::from);
+                cost_usd = v.get("total_cost_usd").and_then(|c| c.as_f64());
+                if v.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+                    error_msg = Some(
+                        v.get("result")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("claude reported an error")
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let status = child.wait().await?;
+    if !status.success() && error_msg.is_none() {
+        error_msg = Some(format!("claude exited {status}"));
+    }
+
+    Ok(final_response(full_text, session_id, cost_usd, error_msg))
+}
+
+fn final_response(
+    response: String,
+    session_id: Option<String>,
+    cost_usd: Option<f64>,
+    error: Option<String>,
+) -> Response {
+    Response {
+        response,
+        session_id,
+        cost_usd,
+        backend: String::new(),
+        error,
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +240,30 @@ mod tests {
         let args = args_of(&cmd);
         assert!(args.contains(&std::ffi::OsStr::new("--resume")));
         assert!(args.contains(&std::ffi::OsStr::new("abc-123")));
+    }
+
+    #[test]
+    fn request_dir_overrides_config_dir() {
+        let mut c = cfg();
+        c.dir = Some("/config-dir".into());
+        let mut r = req("hi");
+        r.dir = Some("/request-dir".into());
+        let cmd = build_command(&c, &r);
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(std::path::Path::new("/request-dir"))
+        );
+    }
+
+    #[test]
+    fn config_dir_used_when_request_dir_absent() {
+        let mut c = cfg();
+        c.dir = Some("/config-dir".into());
+        let cmd = build_command(&c, &req("hi"));
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(std::path::Path::new("/config-dir"))
+        );
     }
 
     #[test]

@@ -1,10 +1,13 @@
 use std::process::Stdio;
 
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use super::{AskRequest, Response};
 use crate::persist::BackendConfig;
+use crate::stream::StreamEvent;
 
 pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
     let mut cmd = Command::new("copilot");
@@ -32,7 +35,7 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
         cmd.arg("--allow-tool").arg(rule);
     }
 
-    if let Some(ref dir) = cfg.dir {
+    if let Some(dir) = req.dir.as_deref().or(cfg.dir.as_deref()) {
         cmd.arg("--add-dir").arg(dir);
         cmd.current_dir(dir);
     }
@@ -98,6 +101,86 @@ pub async fn ask(cfg: &BackendConfig, req: &AskRequest) -> anyhow::Result<Respon
         cost_usd: None,
         backend: String::new(),
         error: None,
+    })
+}
+
+/// Streaming variant — copilot's --output-format=json is already JSONL.
+/// We use:
+///   - `assistant.message_delta` events (data.deltaContent) → emit as Delta
+///   - `assistant.message` event (data.content) → use as final text
+///   - `result` event (sessionId) → terminal
+pub async fn ask_stream(
+    cfg: &BackendConfig,
+    req: &AskRequest,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> anyhow::Result<Response> {
+    let mut cmd = build_command(cfg, req);
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("copilot: stdout was not piped"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut full_text = String::new();
+    let mut session_id = None;
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("assistant.message_delta") => {
+                if let Some(delta) = v
+                    .pointer("/data/deltaContent")
+                    .and_then(Value::as_str)
+                {
+                    full_text.push_str(delta);
+                    if tx
+                        .send(StreamEvent::Delta {
+                            text: delta.to_string(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            Some("assistant.message") => {
+                // Authoritative full content (in case deltas were missed)
+                if let Some(content) = v.pointer("/data/content").and_then(Value::as_str) {
+                    if content.len() > full_text.len() {
+                        let suffix = content[full_text.len()..].to_string();
+                        full_text = content.to_string();
+                        let _ = tx.send(StreamEvent::Delta { text: suffix }).await;
+                    }
+                }
+            }
+            Some("result") => {
+                session_id = v.get("sessionId").and_then(Value::as_str).map(String::from);
+            }
+            _ => {}
+        }
+    }
+
+    let status = child.wait().await?;
+    let error = if !status.success() {
+        Some(format!("copilot exited {status}"))
+    } else {
+        None
+    };
+
+    Ok(Response {
+        response: full_text,
+        session_id,
+        cost_usd: None,
+        backend: String::new(),
+        error,
     })
 }
 

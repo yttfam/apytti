@@ -1,6 +1,6 @@
 [package]
 name = "apytti"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2024"
 
 [lib]
@@ -24,8 +24,18 @@ uuid = { version = "1", features = ["v4"] }
 dialoguer = { version = "0.11", default-features = false }
 dirs = "5"
 toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 async-trait = "0.1"
+futures-util = "0.3"
+async-stream = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSString", "NSThread"] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication", "NSMenu", "NSMenuItem", "NSStatusBar", "NSStatusItem",
+    "NSResponder", "NSRunningApplication",
+] }
 
 [dev-dependencies]
 tempfile = "3"

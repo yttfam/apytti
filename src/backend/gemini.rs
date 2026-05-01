@@ -1,10 +1,13 @@
 use std::process::Stdio;
 
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use super::{AskRequest, Response};
 use crate::persist::BackendConfig;
+use crate::stream::StreamEvent;
 
 #[derive(Debug, serde::Deserialize)]
 struct RawResponse {
@@ -33,7 +36,7 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
         cmd.arg("--yolo");
     }
 
-    if let Some(ref dir) = cfg.dir {
+    if let Some(dir) = req.dir.as_deref().or(cfg.dir.as_deref()) {
         cmd.current_dir(dir);
     }
 
@@ -76,6 +79,106 @@ pub async fn ask(cfg: &BackendConfig, req: &AskRequest) -> anyhow::Result<Respon
     Ok(Response {
         response: raw.response.unwrap_or_default(),
         session_id: raw.session_id,
+        cost_usd: None,
+        backend: String::new(),
+        error,
+    })
+}
+
+/// Streaming variant — gemini's --output-format stream-json emits:
+///   - `{"type":"init","session_id":"..."}` - session id source
+///   - `{"type":"message","role":"assistant","content":"...","delta":true}` - text deltas
+///   - `{"type":"result","status":"success",...}` - terminal
+pub async fn ask_stream(
+    cfg: &BackendConfig,
+    req: &AskRequest,
+    tx: &mpsc::Sender<StreamEvent>,
+) -> anyhow::Result<Response> {
+    let cmd = build_command(cfg, req);
+    // Override to stream-json
+    let args: Vec<_> = cmd.as_std().get_args().collect::<Vec<_>>();
+    let new_args: Vec<String> = args
+        .into_iter()
+        .map(|a| {
+            if a == std::ffi::OsStr::new("json") {
+                "stream-json".to_string()
+            } else {
+                a.to_string_lossy().into_owned()
+            }
+        })
+        .collect();
+    let mut cmd = Command::new("gemini");
+    for a in &new_args {
+        cmd.arg(a);
+    }
+    if let Some(dir) = req.dir.as_deref().or(cfg.dir.as_deref()) {
+        cmd.current_dir(dir);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("gemini: stdout was not piped"))?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut full_text = String::new();
+    let mut session_id = None;
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("init") => {
+                session_id = v.get("session_id").and_then(Value::as_str).map(String::from);
+            }
+            Some("message") => {
+                if v.get("role").and_then(Value::as_str) == Some("assistant") {
+                    if let Some(text) = v.get("content").and_then(Value::as_str) {
+                        let is_delta = v.get("delta").and_then(Value::as_bool).unwrap_or(false);
+                        if is_delta {
+                            full_text.push_str(text);
+                            if tx
+                                .send(StreamEvent::Delta {
+                                    text: text.to_string(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if text.len() > full_text.len() {
+                            // Cumulative-style update — emit suffix
+                            let suffix = text[full_text.len()..].to_string();
+                            full_text = text.to_string();
+                            let _ = tx.send(StreamEvent::Delta { text: suffix }).await;
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                // session_id was already captured from init
+            }
+            _ => {}
+        }
+    }
+
+    let status = child.wait().await?;
+    let error = if !status.success() {
+        Some(format!("gemini exited {status}"))
+    } else {
+        None
+    };
+
+    Ok(Response {
+        response: full_text,
+        session_id,
         cost_usd: None,
         backend: String::new(),
         error,

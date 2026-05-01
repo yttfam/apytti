@@ -6,6 +6,8 @@ pub mod ollama;
 use serde::{Deserialize, Serialize};
 
 use crate::persist::BackendConfig;
+use crate::stream::StreamEvent;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +59,11 @@ pub struct AskRequest {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Per-request working directory override. Together with `session_id`, this
+    /// forms the full session key `(backend, dir, session_id)` — required because
+    /// Claude/Copilot/Gemini scope sessions to the cwd they were started in.
+    /// Ignored by Ollama (it's HTTP, no cwd semantics).
+    pub dir: Option<String>,
 }
 
 /// Unified response shape.
@@ -67,6 +74,41 @@ pub struct Response {
     pub cost_usd: Option<f64>,
     pub backend: String,
     pub error: Option<String>,
+}
+
+/// Dispatch a streaming request — returns a receiver of normalized events.
+/// Each backend spawns a task that reads its native stream format and emits
+/// `StreamEvent`s. The terminal `Done`/`Error` event always carries the
+/// final session_id, cost, etc.
+pub fn dispatch_stream(
+    kind: BackendKind,
+    cfg: BackendConfig,
+    req: AskRequest,
+) -> mpsc::Receiver<StreamEvent> {
+    let (tx, rx) = mpsc::channel(128);
+    let kind_str = kind.to_string();
+    tokio::spawn(async move {
+        let result = match kind {
+            BackendKind::Claude => claude::ask_stream(&cfg, &req, &tx).await,
+            BackendKind::Copilot => copilot::ask_stream(&cfg, &req, &tx).await,
+            BackendKind::Gemini => gemini::ask_stream(&cfg, &req, &tx).await,
+            BackendKind::Ollama => ollama::ask_stream(&cfg, &req, &tx).await,
+        };
+        match result {
+            Ok(mut response) => {
+                response.backend = kind_str;
+                let _ = tx.send(StreamEvent::Done { response }).await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(StreamEvent::Error {
+                        error: format!("{kind_str}: {e}"),
+                    })
+                    .await;
+            }
+        }
+    });
+    rx
 }
 
 /// Dispatch a request to the appropriate backend using its stored config.

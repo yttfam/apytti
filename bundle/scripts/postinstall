@@ -1,0 +1,63 @@
+#!/bin/bash
+# Apytti pkg postinstall.
+# Runs as root after binaries are installed. Creates a per-user config
+# scaffold if one doesn't exist yet and opens Apytti.app in the logged-in
+# user's session so they can configure backends and approve the Local
+# Network prompt.
+
+set -u
+
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  exit 0
+fi
+USER_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+[ -n "$USER_HOME" ] || USER_HOME="/Users/$CONSOLE_USER"
+
+CONFIG_DIR="$USER_HOME/.apytti"
+CONFIG="$CONFIG_DIR/config.toml"
+
+mkdir -p "$CONFIG_DIR"
+chown "$CONSOLE_USER" "$CONFIG_DIR"
+
+if [ ! -f "$CONFIG" ]; then
+  cat > "$CONFIG" <<'EOF'
+# Apytti configuration — edit then re-launch Apytti.app or run `apytti setup`.
+
+# active = "claude"  # uncomment after enabling at least one backend below
+
+[backends.claude]
+enabled = false
+skip_permissions = true
+resume = true
+
+[backends.copilot]
+enabled = false
+skip_permissions = true
+resume = true
+
+[backends.gemini]
+enabled = false
+skip_permissions = true
+resume = true
+
+[backends.ollama]
+enabled = false
+endpoint = "http://localhost:11434"
+model = "llama3.2"
+resume = true
+
+# Optional: announce to a hermytt registry for the family command center
+# [hermytt]
+# url = "http://hermytt.local:7777"
+# token = "..."
+EOF
+  chown "$CONSOLE_USER" "$CONFIG"
+  chmod 600 "$CONFIG"
+fi
+
+# Always launch the app so LaunchServices registers the bundle and the user
+# can click 'Allow' on the Local Network prompt that fires on first connect.
+sudo -u "$CONSOLE_USER" /usr/bin/open -a /Applications/Apytti.app || true
+
+exit 0

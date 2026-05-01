@@ -100,6 +100,20 @@ Response:
 
 Full HTML API documentation served from the binary.
 
+### GET /config
+
+Returns the current PersistedConfig as JSON. All four backends always present even when disabled. Tokens redacted to `"***"` on read.
+
+### PUT /config
+
+Accepts the same shape, merges into current config, persists to `~/.apytti/config.toml`. Partial updates supported. Returns `{"ok": true}`.
+
+Auth: if `hermytt.config_token` is set, requires `X-Hermytt-Key: <token>` header. Otherwise open.
+
+### GET /backends/schema
+
+Static description of each backend's configurable fields with type hints. Lets web UIs render forms without hardcoding apytti-specific knowledge.
+
 ## Configuration
 
 `~/.apytti/config.toml`:
@@ -125,9 +139,16 @@ enabled = false
 enabled = true
 endpoint = "http://localhost:11434"
 model = "llama3.2"
+
+# Optional: announce to hermytt registry for the family command center
+[hermytt]
+url = "http://mista:7777"
+token = "..."          # X-Hermytt-Key header for /registry/announce
+config_token = "..."   # optional; required header for PUT /config writes
+endpoint = "..."       # optional; defaults to http://<hostname>:<port>
 ```
 
-Use `apytti setup` to edit interactively.
+Use `apytti setup` to edit interactively, or `PUT /config` from a remote tool (like hermytt's UI).
 
 ## Library
 
@@ -154,14 +175,22 @@ println!("{}", resp.response);
 ## Daemon install
 
 ```bash
-# macOS — generates LaunchDaemon plist (sudo required to install)
+# Basic
 apytti install --port 7781
 
-# Linux — generates systemd user unit
-apytti install --port 7781
+# Full options (used by hermytt for remote spawn)
+apytti install \
+  --port 7781 \
+  --host 127.0.0.1 \
+  --dir /srv/project-foo \
+  --hermytt-url http://mista:7777 \
+  --hermytt-token <token>
 
-# Windows — prints sc.exe commands
-apytti install --port 7781
+# Inspect installed daemon
+apytti status   # prints JSON: installed, running, version, platform, paths
+
+# Remove
+apytti uninstall
 ```
 
 ## Backend mapping
@@ -170,7 +199,8 @@ apytti install --port 7781
 |---|---|---|---|---|
 | Subprocess | `claude` | `copilot` | `gemini` | (HTTP) |
 | Endpoint | — | — | — | `localhost:11434` |
-| Output | single JSON | JSONL stream | single JSON | HTTP `/api/chat` |
+| Output (apytti uses) | single JSON | JSONL stream | single JSON | HTTP `/api/chat` (non-stream) |
+| Streaming option | yes (`stream-json`) | yes (default) | yes (`stream-json`) | yes (HTTP `stream:true`) |
 | Sessions | `--resume` | `--resume=` | `--resume` | in-memory store |
 | Skip perms | `--dangerously-skip-permissions` | `--allow-all` | `--yolo` | n/a |
 | Effort | yes | yes | n/a | n/a |
