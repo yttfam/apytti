@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apytti settings</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    max-width: 760px;
+    margin: 2rem auto;
+    padding: 0 1rem 6rem;
+    color: #1a1a1a;
+    background: #fafafa;
+    line-height: 1.55;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #e8e8e8; background: #1a1a1a; }
+    .card { background: #242424; border-color: #333; }
+    input, select, textarea { background: #1a1a1a; color: #e8e8e8; border-color: #444; }
+    .badge { background: #333; }
+    .muted { color: #999; }
+    .toolbar { background: #1a1a1a; border-color: #333; }
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+  h1 small { font-weight: normal; color: #888; font-size: 0.85rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 0.75rem; display: flex; align-items: center; gap: 0.5rem; }
+  .card {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1rem;
+  }
+  label { display: block; margin: 0.6rem 0 0.2rem; font-size: 0.85rem; font-weight: 500; }
+  label .hint { font-weight: normal; color: #888; font-size: 0.8rem; margin-left: 0.4rem; }
+  input[type=text], input[type=password], select, textarea {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.9rem;
+  }
+  textarea { font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; min-height: 4.5rem; }
+  input[type=checkbox] { margin-right: 0.4rem; }
+  .row { display: flex; align-items: center; gap: 0.5rem; }
+  .badge {
+    background: #e8e8e8;
+    padding: 0.2rem 0.55rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-family: ui-monospace, Menlo, monospace;
+  }
+  .badge.active { background: #49cc90; color: #fff; }
+  .muted { color: #888; font-size: 0.8rem; }
+  .toolbar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: #fafafa;
+    border-top: 1px solid #ddd;
+    padding: 0.75rem 1rem;
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    z-index: 10;
+  }
+  button {
+    font: inherit;
+    padding: 0.5rem 1rem;
+    border-radius: 5px;
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  button.primary { background: #49cc90; color: #fff; }
+  button.primary:disabled { background: #888; cursor: not-allowed; }
+  button.secondary { background: transparent; border-color: #ccc; color: inherit; }
+  #status { align-self: center; margin-right: auto; font-size: 0.85rem; color: #666; }
+  #status.error { color: #e53e3e; }
+  #status.ok { color: #2f855a; }
+  .active-row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.5rem; }
+  .active-row label { display: inline; margin: 0; font-weight: normal; }
+</style>
+</head>
+<body>
+
+<h1>apytti <small>settings</small></h1>
+<p class="muted" id="version-line">loading…</p>
+
+<div class="card">
+  <h2>Active backend</h2>
+  <p class="muted">The default backend used by <code>/api/ask</code> when no <code>backend</code> override is sent.</p>
+  <div class="active-row" id="active-row"></div>
+</div>
+
+<div class="card" id="auth-card" style="display:none">
+  <h2>Auth <span class="badge">X-Hermytt-Key</span></h2>
+  <p class="muted">A <code>config_token</code> is set in your config, so writes to this page require the same key.</p>
+  <input type="password" id="auth-key" placeholder="X-Hermytt-Key value" autocomplete="off">
+</div>
+
+<div id="backends"></div>
+
+<div class="card">
+  <h2>Hermytt registry <span class="muted" style="font-weight:normal;font-size:0.8rem">(optional)</span></h2>
+  <p class="muted">If set, apytti announces itself on startup and sends periodic heartbeats. Leave blank to run standalone.</p>
+  <label>URL <span class="hint">e.g. http://hermytt.local:7777</span></label>
+  <input type="text" id="hermytt-url">
+  <label>Token <span class="hint">bearer auth for the registry</span></label>
+  <input type="password" id="hermytt-token" autocomplete="off">
+  <label>Config token <span class="hint">if set, PUT /config requires X-Hermytt-Key</span></label>
+  <input type="password" id="hermytt-config-token" autocomplete="off">
+  <label>Endpoint <span class="hint">override of the URL apytti advertises (default http://&lt;hostname&gt;:&lt;port&gt;)</span></label>
+  <input type="text" id="hermytt-endpoint">
+  <label>Name <span class="hint">service name in the registry (default apytti-&lt;hostname&gt;)</span></label>
+  <input type="text" id="hermytt-name">
+</div>
+
+<div class="toolbar">
+  <span id="status"></span>
+  <button class="secondary" id="reload-btn">Reload</button>
+  <button class="primary" id="save-btn" disabled>Save</button>
+</div>
+
+<script>
+'use strict';
+
+const SECRET_PLACEHOLDER = '***';
+let schema = null;
+let config = null;
+
+async function fetchJSON(url, init) {
+  const r = await fetch(url, init);
+  if (!r.ok) {
+    const txt = await r.text().catch(() => r.statusText);
+    throw new Error(`${r.status}: ${txt}`);
+  }
+  return r.json();
+}
+
+function setStatus(msg, kind) {
+  const el = document.getElementById('status');
+  el.textContent = msg || '';
+  el.className = kind || '';
+}
+
+function fieldId(backend, name) {
+  return `f-${backend}-${name}`;
+}
+
+function renderField(backend, f, value) {
+  const id = fieldId(backend, f.name);
+  const lbl = document.createElement('label');
+  lbl.htmlFor = id;
+  lbl.innerHTML = `<code>${f.name}</code>` + (f.hint ? `<span class="hint">${f.hint}</span>` : '');
+
+  let input;
+  if (f.type === 'bool') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.id = id;
+    input.checked = value === true;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.appendChild(input);
+    row.appendChild(lbl);
+    lbl.style.margin = '0';
+    lbl.style.fontWeight = 'normal';
+    return row;
+  } else if (f.type === 'enum' && Array.isArray(f.options)) {
+    input = document.createElement('select');
+    input.id = id;
+    const blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = '— unset —';
+    input.appendChild(blank);
+    for (const o of f.options) {
+      const opt = document.createElement('option');
+      opt.value = o;
+      opt.textContent = o;
+      if (value === o) opt.selected = true;
+      input.appendChild(opt);
+    }
+  } else if (f.type === 'string[]') {
+    input = document.createElement('textarea');
+    input.id = id;
+    input.placeholder = 'one entry per line';
+    input.value = Array.isArray(value) ? value.join('\n') : '';
+  } else {
+    input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.value = (value === null || value === undefined) ? '' : String(value);
+  }
+
+  const wrap = document.createElement('div');
+  wrap.appendChild(lbl);
+  wrap.appendChild(input);
+  return wrap;
+}
+
+function renderActiveRow() {
+  const row = document.getElementById('active-row');
+  row.innerHTML = '';
+  for (const k of Object.keys(schema)) {
+    const id = `active-${k}`;
+    const lbl = document.createElement('label');
+    const r = document.createElement('input');
+    r.type = 'radio';
+    r.name = 'active';
+    r.id = id;
+    r.value = k;
+    if (config.active === k) r.checked = true;
+    lbl.appendChild(r);
+    lbl.appendChild(document.createTextNode(' ' + k));
+    row.appendChild(lbl);
+  }
+  const none = document.createElement('label');
+  const r = document.createElement('input');
+  r.type = 'radio';
+  r.name = 'active';
+  r.value = '';
+  if (!config.active) r.checked = true;
+  none.appendChild(r);
+  none.appendChild(document.createTextNode(' (none)'));
+  row.appendChild(none);
+}
+
+function renderBackends() {
+  const root = document.getElementById('backends');
+  root.innerHTML = '';
+  for (const [name, sch] of Object.entries(schema)) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const h = document.createElement('h2');
+    const enabled = config.backends[name]?.enabled === true;
+    h.innerHTML = `<span class="badge ${enabled ? 'active' : ''}">${name}</span>`;
+    const flags = [];
+    if (sch.supports_streaming) flags.push('streaming');
+    if (sch.supports_effort) flags.push('effort');
+    if (sch.supports_cost) flags.push('cost');
+    if (flags.length) {
+      const span = document.createElement('span');
+      span.className = 'muted';
+      span.style.fontSize = '0.8rem';
+      span.style.fontWeight = 'normal';
+      span.textContent = flags.join(' · ');
+      h.appendChild(span);
+    }
+    card.appendChild(h);
+    const cfg = config.backends[name] || {};
+    for (const f of sch.fields) {
+      card.appendChild(renderField(name, f, cfg[f.name]));
+    }
+    root.appendChild(card);
+  }
+}
+
+function renderHermytt() {
+  const h = config.hermytt || {};
+  const url = document.getElementById('hermytt-url');
+  const tok = document.getElementById('hermytt-token');
+  const ctok = document.getElementById('hermytt-config-token');
+  const ep = document.getElementById('hermytt-endpoint');
+  const nm = document.getElementById('hermytt-name');
+  url.value = h.url || '';
+  tok.value = h.token === SECRET_PLACEHOLDER ? '' : (h.token || '');
+  tok.placeholder = h.token === SECRET_PLACEHOLDER ? '(unchanged)' : '';
+  ctok.value = h.config_token === SECRET_PLACEHOLDER ? '' : (h.config_token || '');
+  ctok.placeholder = h.config_token === SECRET_PLACEHOLDER ? '(unchanged)' : '';
+  ep.value = h.endpoint || '';
+  nm.value = h.name || '';
+
+  const authCard = document.getElementById('auth-card');
+  authCard.style.display = h.config_token === SECRET_PLACEHOLDER ? '' : 'none';
+}
+
+function readField(backend, f) {
+  const el = document.getElementById(fieldId(backend, f.name));
+  if (!el) return undefined;
+  if (f.type === 'bool') return el.checked;
+  if (f.type === 'string[]') {
+    return el.value.split('\n').map(s => s.trim()).filter(Boolean);
+  }
+  const v = el.value.trim();
+  if (v === '') return null;
+  return v;
+}
+
+function buildPayload(originalHermyttConfigToken) {
+  const active = document.querySelector('input[name=active]:checked')?.value || null;
+  const backends = {};
+  for (const [name, sch] of Object.entries(schema)) {
+    const cfg = {};
+    for (const f of sch.fields) {
+      const v = readField(name, f);
+      if (v === undefined || v === null) continue;
+      if (f.type === 'string[]' && v.length === 0) continue;
+      cfg[f.name] = v;
+    }
+    backends[name] = cfg;
+  }
+
+  const url = document.getElementById('hermytt-url').value.trim();
+  const tok = document.getElementById('hermytt-token').value;
+  const ctok = document.getElementById('hermytt-config-token').value;
+  const ep = document.getElementById('hermytt-endpoint').value.trim();
+  const nm = document.getElementById('hermytt-name').value.trim();
+
+  let hermytt = null;
+  if (url || tok || ctok || ep || nm) {
+    hermytt = { url };
+    if (tok) hermytt.token = tok;
+    else if (config.hermytt?.token === SECRET_PLACEHOLDER) hermytt.token = config.hermytt.token; // preserve via re-send is moot; backend stores plain. Skip.
+    if (ctok) hermytt.config_token = ctok;
+    if (ep) hermytt.endpoint = ep;
+    if (nm) hermytt.name = nm;
+  }
+
+  return { active: active || null, backends, hermytt };
+}
+
+async function load() {
+  setStatus('loading…');
+  try {
+    const [health, sch, cfg] = await Promise.all([
+      fetchJSON('/health'),
+      fetchJSON('/backends/schema'),
+      fetchJSON('/config'),
+    ]);
+    schema = sch;
+    config = cfg;
+    document.getElementById('version-line').textContent =
+      `apytti ${health.version} · enabled: ${health.enabled_backends.join(', ') || '(none)'}`;
+    renderActiveRow();
+    renderBackends();
+    renderHermytt();
+    document.getElementById('save-btn').disabled = false;
+    setStatus('');
+  } catch (e) {
+    setStatus(`load failed: ${e.message}`, 'error');
+  }
+}
+
+async function save() {
+  const btn = document.getElementById('save-btn');
+  btn.disabled = true;
+  setStatus('saving…');
+  try {
+    const payload = buildPayload();
+    const headers = { 'Content-Type': 'application/json' };
+    const key = document.getElementById('auth-key').value.trim();
+    if (key) headers['X-Hermytt-Key'] = key;
+    await fetchJSON('/config', {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    setStatus('saved.', 'ok');
+    await load();
+  } catch (e) {
+    setStatus(`save failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('save-btn').addEventListener('click', save);
+document.getElementById('reload-btn').addEventListener('click', load);
+load();
+</script>
+
+</body>
+</html>

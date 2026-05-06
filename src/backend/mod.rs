@@ -83,18 +83,20 @@ pub struct Response {
     pub error: Option<String>,
 }
 
-/// Dispatch a streaming request — returns a receiver of normalized events.
+/// Dispatch a streaming request — returns a receiver of normalized events
+/// plus the worker task's `AbortHandle` so the request can be cancelled.
 /// Each backend spawns a task that reads its native stream format and emits
-/// `StreamEvent`s. The terminal `Done`/`Error` event always carries the
-/// final session_id, cost, etc.
+/// `StreamEvent`s. Aborting the handle drops the worker future, which drops
+/// the underlying `Child` (with `kill_on_drop(true)` set in build_command),
+/// SIGKILLing the subprocess.
 pub fn dispatch_stream(
     kind: BackendKind,
     cfg: BackendConfig,
     req: AskRequest,
-) -> mpsc::Receiver<StreamEvent> {
+) -> (mpsc::Receiver<StreamEvent>, tokio::task::AbortHandle) {
     let (tx, rx) = mpsc::channel(128);
     let kind_str = kind.to_string();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let result = match kind {
             BackendKind::Claude => claude::ask_stream(&cfg, &req, &tx).await,
             BackendKind::Copilot => copilot::ask_stream(&cfg, &req, &tx).await,
@@ -115,7 +117,7 @@ pub fn dispatch_stream(
             }
         }
     });
-    rx
+    (rx, handle.abort_handle())
 }
 
 /// Dispatch a request to the appropriate backend using its stored config.

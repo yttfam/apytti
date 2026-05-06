@@ -31,7 +31,7 @@ Send a prompt to a backend.
 **Request body**:
 ```json
 {
-  "prompt": "string",                         // required
+  "prompt": "string",                         // required unless `attachments` is non-empty
   "backend": "claude|copilot|gemini|ollama",  // optional, defaults to active
   "session_id": "uuid",                       // optional, resumes session
   "model": "string",                          // optional, overrides default
@@ -40,18 +40,22 @@ Send a prompt to a backend.
   "stream": false,                            // optional, returns SSE if true
   "agent": "infrakid",                        // optional (claude only) — passes --agent <name>
   "command": "review",                        // optional (claude only) — expand ~/.claude/commands/review.md, $ARGUMENTS = prompt
-  "attachments": [                            // optional, file references on the apytti host's filesystem
+  "attachments": [                            // optional; one of `path` OR `data` per entry
     { "path": "/abs/path/kitchen.jpg", "kind": "image", "name": "kitchen.jpg" },
+    { "data": "<base64>",              "kind": "image", "name": "selfie.jpg"  },
     { "path": "/abs/path/lease.pdf",   "kind": "document" }
   ]
 }
 ```
 
-**Attachments**: each entry is `{path, kind?, name?}`. `path` is required, must be absolute, exist, and be a regular file. `kind` is one of `image | document | voice | video | audio` (defaults to extension-based inference). `name` is the original filename for display (defaults to basename).
+**Attachments**: each entry is `{path?, data?, kind?, name?}`. Exactly one of `path` or `data` per entry — both → 400, neither → 400. `kind` is one of `image | document | voice | video | audio` (defaults to extension-based inference, using `name` if present, else the path's basename). `name` is the original filename for display.
+
+- **`path`** form — absolute path on apytti's filesystem. Must exist and be a regular file. Use when the caller and apytti share a filesystem.
+- **`data`** form — base64-encoded raw bytes. Use when the caller is on a different host. Apytti decodes the bytes, writes them to a per-request temp dir under `~/.apytti/inbox/<uuid>/`, uses that path for the rest of the call, and deletes the dir when the request finishes (RAII cleanup; survives errors). Filenames derived from `name` (sanitized: only `[A-Za-z0-9._-]`, with index prefix to disambiguate).
 
 Apytti prepends a reference line per attachment to the prompt (`[attached <kind>: <name> -> <path>]`) and, for the claude CLI backend, mints a per-call `--allowedTools Read(<path>)` rule so the file is readable without `--dangerously-skip-permissions`. Per-call scope only — never persisted to `~/.apytti/config.toml`.
 
-**Security gate** (optional): set `[security] attachment_roots = ["/tmp/pyttch-bridge", ...]` in the persisted config to require every `attachments[].path` live inside one of those roots. Unset = no whitelist enforcement (existence/regular-file checks still apply).
+**Security gate** (optional, `path` form only): set `[security] attachment_roots = ["/tmp/pyttch-bridge", ...]` in the persisted config to require every `attachments[].path` live inside one of those roots. The `data` form is unaffected — apytti owns the write location. Unset = no whitelist enforcement (existence/regular-file checks still apply to `path`).
 
 **Response (non-streaming)** — `application/json`:
 ```json
@@ -69,6 +73,12 @@ Apytti prepends a reference line per attachment to the prompt (`[attached <kind>
 event: delta
 data: {"type":"delta","text":"hello"}
 
+event: tool_use
+data: {"type":"tool_use","name":"Bash","input_summary":"git status"}
+
+event: tool_result
+data: {"type":"tool_result","name":"Bash"}
+
 event: delta
 data: {"type":"delta","text":" world"}
 
@@ -76,7 +86,38 @@ event: done
 data: {"type":"done","response":"hello world","session_id":"...","cost_usd":...,"backend":"...","error":null}
 ```
 
-Plus `event: error` mid-stream on fatal failures.
+Event types:
+- `delta` — incremental text chunk; concatenate to build the assistant turn.
+- `tool_use` — model started a tool call. `input_summary` is a one-line preview (same shape as the `tool_uses[]` field in `GET /sessions/{sid}/messages`); omitted when nothing useful to show.
+- `tool_result` — the tool returned. No body — bridge UIs can use this to clear a "🔧 running…" placeholder.
+- `done` — terminal event with full response payload.
+- `error` — terminal event for fatal stream failures.
+
+Ordering: `tool_use` before any deltas/results that follow from it; `done` is always last (or `error`). Tool events are claude-only today; other backends emit `delta` + `done` only.
+
+---
+
+## DELETE /api/ask
+
+**Kill switch.** Aborts every in-flight `/api/ask` call. Each backend Command runs with `kill_on_drop`, so the underlying subprocess is SIGKILL'd as the future drops.
+
+```json
+{ "killed": 3 }
+```
+
+Cancelled non-streaming callers receive a `400` with `error: "cancelled"`. Streaming callers see the SSE stream close mid-flight (no `done`/`error` event guaranteed).
+
+---
+
+## POST /backends/{name}/sessions/{sid}/cancel
+
+Cancel any in-flight `/api/ask` call(s) for this `(backend, session_id)`. Sessionless calls aren't matched here — use `DELETE /api/ask` for those.
+
+```json
+{ "killed": 1 }
+```
+
+Returns `{"killed": 0}` (with 200) if nothing was in flight.
 
 ---
 
@@ -96,6 +137,12 @@ Plus `event: error` mid-stream on fatal failures.
 ## GET /help
 
 `text/html` — the in-binary documentation page.
+
+---
+
+## GET /config-ui
+
+`text/html` — self-contained settings page. Reads `/backends/schema`, `/health`, and `/config`, lets you edit each backend's fields, the active default, and hermytt registry settings, then PUTs back to `/config`. The macOS menu-bar app exposes it via the "Settings…" item, but it works in any browser.
 
 ---
 
@@ -247,6 +294,13 @@ Detect whether a session is currently being processed by some other process (cat
 ## GET /backends/{name}/sessions/{sid}/messages
 
 **Auth**: `X-Hermytt-Key` (when `config_token` set). Logs may contain secrets.
+**Query**: `?since=<int>` — return only messages from index `<since>` onward (cheap incremental fetch for long sessions).
+
+- `since` ≤ 0 or omitted: full set returned.
+- `since` valid (`0 <= since <= total`): `messages[since..]` returned.
+- `since` > `total` (file truncated/edited externally): full set returned, so the client sees index 0 and knows to reset.
+
+Response always includes `total` (length of the underlying log) so the client can tell whether it's caught up.
 
 Full conversation as a flat ordered array. Backend-agnostic shape.
 
@@ -254,6 +308,7 @@ Full conversation as a flat ordered array. Backend-agnostic shape.
 {
   "session_id": "uuid",
   "dir": "/path",
+  "total": 7742,
   "messages": [
     { "role": "user",
       "content": "explain this codebase",

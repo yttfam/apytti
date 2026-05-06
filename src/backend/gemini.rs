@@ -42,6 +42,7 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     cmd
 }
@@ -115,6 +116,7 @@ pub async fn ask_stream(
         cmd.current_dir(dir);
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn()?;
     let stdout = child

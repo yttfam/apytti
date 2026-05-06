@@ -30,6 +30,20 @@ pub struct ServerState {
     /// session so apytti doesn't fork itself. External processes (interactive claude) aren't
     /// covered here; use GET /backends/{name}/sessions/{sid}/status for that.
     pub session_locks: Mutex<HashMap<(String, String, String), Arc<Mutex<()>>>>,
+    /// Registry of in-flight /api/ask calls, keyed by a unique token. Each entry
+    /// is `(backend, sid, abort_handle)`. Cancellation endpoints look up entries
+    /// by `(backend, sid)` (cancel by session) or drain all (kill switch).
+    /// Sessionless calls get a synthetic sid prefixed `__nosession__<uuid>`.
+    pub in_flight: Mutex<HashMap<u64, InFlight>>,
+    /// Monotonic counter for in_flight tokens.
+    pub next_in_flight: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug)]
+pub struct InFlight {
+    pub backend: String,
+    pub sid: String,
+    pub abort: tokio::task::AbortHandle,
 }
 
 impl ServerState {
@@ -38,7 +52,35 @@ impl ServerState {
             config: RwLock::new(config),
             config_path,
             session_locks: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            next_in_flight: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// Register an in-flight /api/ask call and return its token. Use the token
+    /// to deregister via `unregister_in_flight` when the call returns. The
+    /// `AbortHandle` is what the cancel endpoints invoke.
+    pub async fn register_in_flight(
+        &self,
+        backend: &str,
+        sid: &str,
+        abort: tokio::task::AbortHandle,
+    ) -> u64 {
+        use std::sync::atomic::Ordering;
+        let token = self.next_in_flight.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.lock().await.insert(
+            token,
+            InFlight {
+                backend: backend.to_string(),
+                sid: sid.to_string(),
+                abort,
+            },
+        );
+        token
+    }
+
+    pub async fn unregister_in_flight(&self, token: u64) {
+        self.in_flight.lock().await.remove(&token);
     }
 
     /// Get-or-create the mutex for a given session triple.
@@ -105,8 +147,8 @@ pub async fn ask(
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    if body.prompt.is_empty() {
-        return Err(AppError::BadRequest("prompt is required".into()));
+    if body.prompt.is_empty() && body.attachments.is_empty() {
+        return Err(AppError::BadRequest("prompt or attachments required".into()));
     }
 
     // If `command` is set, expand the template (substituting $ARGUMENTS with
@@ -141,16 +183,21 @@ pub async fn ask(
         (kind, cfg, roots)
     };
 
-    // Validate every attachment up front; bail with a clean 400 on any failure.
-    for att in &body.attachments {
-        attachments::validate(att, &attachment_roots)
+    // Resolve attachments: validate `path` form, materialize `data` form into
+    // a per-request inbox dir under ~/.apytti/inbox/. The guard schedules a
+    // deferred (5-minute by default) cleanup on drop so external agents who
+    // receive the path in the response can still read it.
+    let inbox_root = dirs::home_dir()
+        .map(|h| h.join(".apytti").join("inbox"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/apytti-inbox"));
+    let (resolved_attachments, _inbox_guard) =
+        attachments::resolve(&body.attachments, &attachment_roots, &inbox_root)
             .map_err(AppError::BadRequest)?;
-    }
-    if !body.attachments.is_empty() {
-        let prefix = attachments::prompt_prefix(&body.attachments);
+    if !resolved_attachments.is_empty() {
+        let prefix = attachments::prompt_prefix(&resolved_attachments);
         effective_prompt = format!("{prefix}{effective_prompt}");
     }
-    let extra_allow = attachments::allow_rules(&body.attachments);
+    let extra_allow = attachments::allow_rules(&resolved_attachments);
 
     let prompt_preview: String = effective_prompt.chars().take(100).collect();
     info!(
@@ -187,15 +234,50 @@ pub async fn ask(
         None
     };
 
+    // Synthetic sid for sessionless calls so the in-flight registry has a key
+    // we can match against in the cancel endpoints.
+    let registry_sid = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("__nosession__{}", uuid::Uuid::new_v4()));
+
     if body.stream {
-        let rx = dispatch_stream(kind, cfg, req);
-        let stream = sse_stream_from_rx(rx);
+        let (rx, abort) = dispatch_stream(kind, cfg, req);
+        let token = state
+            .register_in_flight(kind.as_str(), &registry_sid, abort)
+            .await;
+        let state_for_dereg = state.clone();
+        let stream = sse_stream_from_rx(rx, move || {
+            let s = state_for_dereg.clone();
+            tokio::spawn(async move { s.unregister_in_flight(token).await });
+        });
         let sse = Sse::new(stream).keep_alive(KeepAlive::default());
         return Ok(sse.into_response());
     }
 
+    // Non-streaming path: spawn dispatch on a tokio task so its AbortHandle
+    // can be registered. AskRequest + BackendConfig are cheap to clone (small
+    // strings + Vec<String>). When AbortHandle::abort is called, the task's
+    // future drops, dropping the underlying tokio::process::Child, which
+    // SIGKILLs the subprocess via `kill_on_drop(true)`.
     let start = std::time::Instant::now();
-    let resp = dispatch(kind, &cfg, &req).await;
+    let req_owned = req.clone();
+    let cfg_owned = cfg.clone();
+    let join = tokio::spawn(async move { dispatch(kind, &cfg_owned, &req_owned).await });
+    let token = state
+        .register_in_flight(kind.as_str(), &registry_sid, join.abort_handle())
+        .await;
+    let outcome = join.await;
+    state.unregister_in_flight(token).await;
+    let resp = match outcome {
+        Ok(resp) => resp,
+        Err(e) if e.is_cancelled() => {
+            return Err(AppError::BadRequest("cancelled".into()));
+        }
+        Err(e) => {
+            return Err(AppError::Internal(format!("dispatch task failed: {e}")));
+        }
+    };
     let elapsed = start.elapsed();
 
     info!(
@@ -218,16 +300,24 @@ pub async fn ask(
 }
 
 /// Convert an mpsc receiver of StreamEvents into an SSE-compatible Stream.
-fn sse_stream_from_rx(
+/// `on_finish` is invoked when the receiver closes (normal completion OR
+/// abort) so the caller can deregister from the in-flight registry.
+fn sse_stream_from_rx<F>(
     mut rx: tokio::sync::mpsc::Receiver<StreamEvent>,
-) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    on_finish: F,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>>
+where
+    F: FnOnce() + Send + 'static,
+{
     async_stream::stream! {
+        let mut cleanup = Some(on_finish);
         while let Some(event) = rx.recv().await {
             let name = event.sse_event();
             let data = serde_json::to_string(&event)
                 .unwrap_or_else(|_| String::from("{\"type\":\"error\",\"error\":\"serialize failed\"}"));
             yield Ok(Event::default().event(name).data(data));
         }
+        if let Some(cb) = cleanup.take() { cb(); }
     }
 }
 
@@ -245,6 +335,14 @@ fn resolve_backend(cfg: &PersistedConfig, requested: Option<&str>) -> Result<Bac
 
 pub async fn help() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("help.html"))
+}
+
+/// GET /config-ui — tiny self-contained settings page that reads
+/// /backends/schema + /config + /health and PUTs back to /config. Lets a
+/// standalone apytti install (no hermytt) do first-run setup from a browser
+/// instead of editing ~/.apytti/config.toml by hand.
+pub async fn config_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("config_ui.html"))
 }
 
 pub async fn health(state: Arc<ServerState>) -> Json<HealthResponse> {
@@ -530,6 +628,7 @@ pub async fn get_backend_session_messages(
     state: Arc<ServerState>,
     headers: HeaderMap,
     Path((name, sid)): Path<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<MessagesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     {
         let snapshot = state.config.read().await;
@@ -547,9 +646,72 @@ pub async fn get_backend_session_messages(
 
     let kind = BackendKind::parse(&name)
         .ok_or_else(|| AppError::BadRequest(format!("unknown backend: {name}")))?;
-    let log = sessions::read_messages(kind, &sid)
+    let mut log = sessions::read_messages(kind, &sid)
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(serde_json::to_value(log).unwrap_or(serde_json::Value::Null)))
+
+    let total = log.messages.len();
+    // `since`: if non-negative and <= total, slice [since..]. If out-of-range
+    // (greater than total — file got truncated/edited externally), return
+    // everything starting at index 0 so the client can detect the reset.
+    if let Some(since) = q.since {
+        if since > 0 && (since as usize) <= total {
+            log.messages.drain(..since as usize);
+        }
+    }
+
+    let mut out = serde_json::to_value(log).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("total".into(), serde_json::Value::from(total));
+    }
+    Ok(Json(out))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MessagesQuery {
+    pub since: Option<i64>,
+}
+
+/// POST /backends/{name}/sessions/{sid}/cancel — abort any in-flight
+/// /api/ask call(s) for this (backend, sid). Triggers `kill_on_drop` on the
+/// underlying Child, SIGKILLing the subprocess.
+/// Returns `{"killed": N}` (0 if no matching in-flight call).
+pub async fn cancel_backend_session(
+    state: Arc<ServerState>,
+    Path((name, sid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let kind = BackendKind::parse(&name)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown backend: {name}")))?;
+    let backend_str = kind.as_str().to_string();
+    let mut killed = 0usize;
+    let mut registry = state.in_flight.lock().await;
+    let to_remove: Vec<u64> = registry
+        .iter()
+        .filter(|(_, e)| e.backend == backend_str && e.sid == sid)
+        .map(|(t, _)| *t)
+        .collect();
+    for token in to_remove {
+        if let Some(entry) = registry.remove(&token) {
+            entry.abort.abort();
+            killed += 1;
+        }
+    }
+    info!(backend = name, session_id = sid, killed, "cancel by session");
+    Ok(Json(serde_json::json!({ "killed": killed })))
+}
+
+/// DELETE /api/ask — kill switch. Aborts every in-flight /api/ask call.
+/// Returns `{"killed": N}`.
+pub async fn cancel_all_ask(
+    state: Arc<ServerState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let mut registry = state.in_flight.lock().await;
+    let entries: Vec<InFlight> = registry.drain().map(|(_, v)| v).collect();
+    let killed = entries.len();
+    for entry in entries {
+        entry.abort.abort();
+    }
+    info!(killed, "kill switch — all in-flight /api/ask aborted");
+    Ok(Json(serde_json::json!({ "killed": killed })))
 }
 
 /// GET /backends/{name}/sessions/{sid}/status — detect whether the session

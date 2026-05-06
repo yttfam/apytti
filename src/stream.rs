@@ -9,10 +9,20 @@ use serde::Serialize;
 use crate::backend::Response;
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// Incremental text chunk. Concatenate to build the full response.
     Delta { text: String },
+    /// The model started a tool call. `input_summary` is a one-line preview
+    /// (matches the shape returned by GET /backends/{name}/sessions/{sid}/messages).
+    ToolUse {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_summary: Option<String>,
+    },
+    /// The tool call returned. No body — just the "now done" signal so a
+    /// progressive UI can clear the spinner / advance.
+    ToolResult { name: String },
     /// Terminal event — request completed.
     Done {
         #[serde(flatten)]
@@ -27,6 +37,8 @@ impl StreamEvent {
     pub fn sse_event(&self) -> &'static str {
         match self {
             Self::Delta { .. } => "delta",
+            Self::ToolUse { .. } => "tool_use",
+            Self::ToolResult { .. } => "tool_result",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
         }
@@ -79,5 +91,40 @@ mod tests {
             "delta"
         );
         assert_eq!(StreamEvent::Error { error: "x".into() }.sse_event(), "error");
+        assert_eq!(
+            StreamEvent::ToolUse { name: "Bash".into(), input_summary: None }.sse_event(),
+            "tool_use",
+        );
+        assert_eq!(
+            StreamEvent::ToolResult { name: "Bash".into() }.sse_event(),
+            "tool_result",
+        );
+    }
+
+    #[test]
+    fn tool_use_serializes() {
+        let e = StreamEvent::ToolUse {
+            name: "Bash".into(),
+            input_summary: Some("git status".into()),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"type\":\"tool_use\""));
+        assert!(s.contains("\"name\":\"Bash\""));
+        assert!(s.contains("\"input_summary\":\"git status\""));
+    }
+
+    #[test]
+    fn tool_use_omits_summary_when_none() {
+        let e = StreamEvent::ToolUse { name: "Bash".into(), input_summary: None };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(!s.contains("input_summary"));
+    }
+
+    #[test]
+    fn tool_result_serializes() {
+        let e = StreamEvent::ToolResult { name: "Bash".into() };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"type\":\"tool_result\""));
+        assert!(s.contains("\"name\":\"Bash\""));
     }
 }

@@ -1,3 +1,6 @@
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::field_reassign_with_default)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -89,10 +92,40 @@ async fn init_models(config_path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn init_tracing(level: &str) {
-    use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()))
-        .try_init();
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
+    // Always log to stdout (visible in Console.app under the Apytti process and
+    // useful when running `apytti run` from a terminal).
+    let stdout_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+
+    // Also tee to ~/Library/Logs/Apytti/apytti.log so the menu-bar "Open Log"
+    // item opens a file with actual content. Non-rolling — same path forever
+    // so the menu item link stays stable; user can rotate it manually if it
+    // ever gets large.
+    let file_layer = log_file_path()
+        .and_then(|path| {
+            let dir = path.parent()?.to_path_buf();
+            let filename = path.file_name()?.to_string_lossy().into_owned();
+            std::fs::create_dir_all(&dir).ok()?;
+            let appender = tracing_appender::rolling::never(&dir, &filename);
+            Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(appender))
+        });
+
+    let registry = tracing_subscriber::registry().with(filter).with(stdout_layer);
+    let _ = match file_layer {
+        Some(fl) => registry.with(fl).try_init(),
+        None => registry.try_init(),
+    };
+}
+
+/// Where the menu-bar "Open Log" item points. Mirrors `macos_menu::log_file_path`.
+fn log_file_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library/Logs/Apytti/apytti.log"))
 }
 
 fn run_server(args: RunArgs, config_path: PathBuf) -> anyhow::Result<()> {

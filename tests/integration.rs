@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,7 +87,7 @@ async fn ask_empty_prompt_returns_400() {
 
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("prompt is required"));
+    assert!(body["error"].as_str().unwrap().contains("prompt or attachments required"));
 }
 
 #[tokio::test]
@@ -391,7 +392,7 @@ async fn ask_request_accepts_dir_field() {
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
     // Failed because of empty prompt, not because dir was rejected
-    assert!(body["error"].as_str().unwrap().contains("prompt is required"));
+    assert!(body["error"].as_str().unwrap().contains("prompt or attachments required"));
 }
 
 #[tokio::test]

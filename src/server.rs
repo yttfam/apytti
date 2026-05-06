@@ -14,13 +14,22 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     let s_get_backend_models = state.clone();
     let s_init_models = state.clone();
 
+    let s_cancel_all = state.clone();
+    let s_cancel_session = state.clone();
+
     Router::new()
         .route(
             "/api/ask",
-            post(move |body| handler::ask(s_ask, body)),
+            post(move |body| handler::ask(s_ask, body))
+                .delete(move || handler::cancel_all_ask(s_cancel_all)),
+        )
+        .route(
+            "/backends/{name}/sessions/{sid}/cancel",
+            post(move |path| handler::cancel_backend_session(s_cancel_session, path)),
         )
         .route("/health", get(move || handler::health(s_health)))
         .route("/help", get(handler::help))
+        .route("/config-ui", get(handler::config_ui))
         .route("/config", get(move || handler::get_config(s_get_cfg)))
         .route(
             "/config",
@@ -59,8 +68,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             "/backends/{name}/sessions/{sid}/messages",
             get({
                 let state = state.clone();
-                move |headers, path| {
-                    handler::get_backend_session_messages(state, headers, path)
+                move |headers, path, query| {
+                    handler::get_backend_session_messages(state, headers, path, query)
                 }
             }),
         )

@@ -40,6 +40,7 @@ pub struct HandlerIvars {
     log_path: PathBuf,
     config_dir: PathBuf,
     help_url: String,
+    settings_url: String,
     app_path: String,
     login_item_name: String,
 }
@@ -76,6 +77,13 @@ declare_class!(
         fn open_help(&self, _sender: Option<&AnyObject>) {
             let _ = Command::new("/usr/bin/open")
                 .arg(&self.ivars().help_url)
+                .spawn();
+        }
+
+        #[method(openSettings:)]
+        fn open_settings(&self, _sender: Option<&AnyObject>) {
+            let _ = Command::new("/usr/bin/open")
+                .arg(&self.ivars().settings_url)
                 .spawn();
         }
 
@@ -252,6 +260,7 @@ pub fn run(
             log_path: log_path.clone(),
             config_dir,
             help_url: format!("http://127.0.0.1:{port}/help"),
+            settings_url: format!("http://127.0.0.1:{port}/config-ui"),
             app_path: "/Applications/Apytti.app".to_string(),
             login_item_name: "Apytti".to_string(),
         },
@@ -283,6 +292,7 @@ pub fn run(
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+    add_item(mtm, &menu, "Settings…", sel!(openSettings:), &handler);
     add_item(mtm, &menu, "Open Help", sel!(openHelp:), &handler);
     add_item(mtm, &menu, "Open Config Folder", sel!(openConfig:), &handler);
     add_item(mtm, &menu, "Open Log", sel!(openLog:), &handler);

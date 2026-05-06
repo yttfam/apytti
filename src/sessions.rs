@@ -504,7 +504,7 @@ fn flatten_claude_content(content: Option<&serde_json::Value>) -> (String, Vec<T
 
 /// One-line summary of a tool's input. Picks the most useful field per tool name,
 /// falls back to the first string-ish value.
-fn summarize_tool_input(input: &serde_json::Value, tool_name: &str) -> String {
+pub fn summarize_tool_input(input: &serde_json::Value, tool_name: &str) -> String {
     let pick = |keys: &[&str]| -> Option<String> {
         for k in keys {
             if let Some(s) = input.get(k).and_then(|v| v.as_str()) {

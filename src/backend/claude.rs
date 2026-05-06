@@ -61,6 +61,10 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // SIGKILL the subprocess if the owning future drops (cancellation /
+    // request abort). Without this, /api/ask cancellations would leave
+    // claude running until natural completion.
+    cmd.kill_on_drop(true);
 
     cmd
 }
@@ -130,6 +134,9 @@ pub async fn ask_stream(
     let mut full_text = String::new();
     let mut emitted_len = 0usize;
     let mut error_msg: Option<String> = None;
+    // Map tool_use_id -> tool name so subsequent tool_result blocks
+    // (which only carry the id) can be paired with their tool name.
+    let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim();
@@ -146,19 +153,66 @@ pub async fn ask_stream(
                     .and_then(|c| c.as_array())
                 {
                     for block in content {
-                        if let Some(text) = block
-                            .get("type")
-                            .and_then(|t| t.as_str())
-                            .filter(|t| *t == "text")
-                            .and(block.get("text").and_then(|t| t.as_str()))
-                        {
-                            full_text = text.to_string();
-                            if full_text.len() > emitted_len {
-                                let delta = full_text[emitted_len..].to_string();
-                                emitted_len = full_text.len();
-                                if tx.send(StreamEvent::Delta { text: delta }).await.is_err() {
+                        let bt = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match bt {
+                            "text" => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    full_text = text.to_string();
+                                    if full_text.len() > emitted_len {
+                                        let delta = full_text[emitted_len..].to_string();
+                                        emitted_len = full_text.len();
+                                        if tx.send(StreamEvent::Delta { text: delta }).await.is_err() {
+                                            return Ok(final_response(full_text, session_id, cost_usd, error_msg));
+                                        }
+                                    }
+                                }
+                            }
+                            "tool_use" => {
+                                let name = block
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
+                                if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                                    tool_names.insert(id.to_string(), name.clone());
+                                }
+                                let input_summary = block
+                                    .get("input")
+                                    .map(|i| crate::sessions::summarize_tool_input(i, &name));
+                                if tx
+                                    .send(StreamEvent::ToolUse { name, input_summary })
+                                    .await
+                                    .is_err()
+                                {
                                     return Ok(final_response(full_text, session_id, cost_usd, error_msg));
                                 }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("user") => {
+                // Tool results come back in user-role messages following an
+                // assistant tool_use. Only the tool_use_id is present, so we
+                // look up the name from the map populated above.
+                if let Some(content) = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                            let name = block
+                                .get("tool_use_id")
+                                .and_then(|i| i.as_str())
+                                .and_then(|id| tool_names.get(id).cloned())
+                                .unwrap_or_else(|| "?".to_string());
+                            if tx
+                                .send(StreamEvent::ToolResult { name })
+                                .await
+                                .is_err()
+                            {
+                                return Ok(final_response(full_text, session_id, cost_usd, error_msg));
                             }
                         }
                     }

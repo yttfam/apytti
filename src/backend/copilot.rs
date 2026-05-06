@@ -42,6 +42,7 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     cmd
 }
