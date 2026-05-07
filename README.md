@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="apytti" width="180"/></p>
+
 # apytti
 
 "A pity" the AI CLIs don't share an API. So here's one.
