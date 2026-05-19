@@ -6,6 +6,15 @@
 
 A unified REST gateway over Claude, Copilot, Gemini, and Ollama. One binary, one endpoint, four backends.
 
+> ⚠️ **Heads up — Claude billing change (2026-06-15)**
+>
+> Starting **June 15th, 2026**, Anthropic is billing `claude -p` (non-interactive / headless mode) **separately from Claude Pro/Max subscriptions** — every call goes against API credits instead of being covered by your seat.
+>
+> Because apytti drives Claude exclusively through `claude -p`, **using this harness with the `claude` backend after that date will bill you per token on top of your subscription**. If you're on Pro/Max and expected flat-rate coverage, **don't point production traffic at apytti's claude backend from June 15th onward**.
+>
+> The Copilot, Gemini, and Ollama backends are unaffected.
+
+
 ## Features
 
 - Single REST API in front of `claude`, `copilot`, `gemini`, and Ollama (HTTP)
