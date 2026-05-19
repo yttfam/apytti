@@ -2,6 +2,11 @@
 name = "apytti"
 version = "0.6.8"
 edition = "2024"
+description = "Multi-backend REST gateway for AI CLIs (Claude, Copilot, Gemini, Ollama)"
+license = "MIT"
+homepage = "https://github.com/yttfam/apytti"
+repository = "https://github.com/yttfam/apytti.git"
+authors = ["Nico Bousquet <com@calii.net>"]
 
 [lib]
 name = "apytti"
@@ -41,3 +46,35 @@ objc2-app-kit = { version = "0.2", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+# ---- Linux packaging metadata ------------------------------------------------
+# Consumed by `cargo-deb` and `cargo-generate-rpm` in the release pipeline.
+# Both tools just package files — no Linux host required to produce the
+# artifacts; the release workflow runs from macOS-arm64 runners after the
+# musl statics have been cross-compiled.
+[package.metadata.deb]
+maintainer = "Nico Bousquet <com@calii.net>"
+copyright = "2026, Nico Bousquet"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Apytti is a stateless HTTP gateway in front of headless AI CLIs. It exposes \
+a unified REST + SSE API so any client can target Claude, Copilot, Gemini, \
+or Ollama through one endpoint with normalized event streams, attachments, \
+session lifecycle, and cancel."""
+section = "utils"
+priority = "optional"
+# `assets` is overridden at invocation time by the release workflow because the
+# binary path differs per target triple (target/<triple>/release/apytti for
+# cross-builds vs target/release/apytti for the host build).
+assets = [
+    ["target/release/apytti", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/apytti/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+license = "MIT"
+summary = "Multi-backend REST gateway for AI CLIs (Claude, Copilot, Gemini, Ollama)"
+assets = [
+    { source = "target/release/apytti", dest = "/usr/bin/apytti", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/apytti/README.md", mode = "644", doc = true },
+]
