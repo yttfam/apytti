@@ -31,11 +31,27 @@ KEYCHAIN_PASSWORD="apytti-build"
 trap 'security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null; rm -rf "$WORKDIR" "$DMG_STAGE"' EXIT
 
 [[ -x "$BINARY_PATH" ]] || { echo "fatal: binary not found at $BINARY_PATH"; exit 1; }
-[[ -n "${VAULT_TOKEN:-}" && -n "${VAULT_ADDR:-}" ]] || { echo "fatal: VAULT_TOKEN+VAULT_ADDR required"; exit 1; }
 
-echo "==> Fetching credentials from Vault"
-ASC=$(curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/secret/data/infra/apple-asc" | jq -r '.data.data')
-APP_CERT=$(curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/secret/data/infra/apple-cert-developer-id-application" | jq -r '.data.data' 2>/dev/null || echo "")
+# Credentials source: env JSON (CI) -> Vault (local dev). Both paths produce
+# the same shape so downstream jq calls don't care which one wins.
+get_secret_json() {
+    local env_var="$1" vault_path="$2"
+    local value="${!env_var:-}"
+    if [[ -n "$value" ]]; then
+        echo "$value"; return 0
+    fi
+    if [[ -n "${VAULT_TOKEN:-}" && -n "${VAULT_ADDR:-}" ]]; then
+        curl -fsS -H "X-Vault-Token: $VAULT_TOKEN" \
+            "$VAULT_ADDR/v1/secret/data/$vault_path" | jq -r '.data.data'
+        return $?
+    fi
+    echo "fatal: need $env_var env var, or VAULT_TOKEN+VAULT_ADDR with $vault_path" >&2
+    return 1
+}
+
+echo "==> Resolving credentials"
+ASC=$(get_secret_json APPLE_ASC_JSON infra/apple-asc)
+APP_CERT=$(get_secret_json APPLE_APP_CERT_JSON infra/apple-cert-developer-id-application 2>/dev/null || echo "")
 
 KEY_ID=$(echo "$ASC" | jq -r '.key_id')
 ISSUER_ID=$(echo "$ASC" | jq -r '.issuer_id')

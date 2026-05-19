@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow re-running a specific tag's release manually from the Actions tab
+  # without having to delete + retag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)build (e.g. v0.6.9)"
+        required: true
+
+jobs:
+  release:
+    # macos-14 is M1/arm64 hosted. Native build target = aarch64-apple-darwin,
+    # same as Cali's dev box. Cross-compile from here for Linux + Windows.
+    runs-on: macos-14
+
+    permissions:
+      contents: write   # for softprops/action-gh-release
+
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "ref=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout (at tag)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.ref }}
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # Toolchains. macos-14 ships rustup + xcode CLI tools + codesign +
+      # productsign + pkgbuild + xcrun + hdiutil. Cross linkers + packagers
+      # come from brew.
+      # ----------------------------------------------------------------------
+
+      - name: Install Rust cross targets
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+          rustup target add x86_64-pc-windows-gnu
+
+      - name: Install cross toolchains (zig for linux-musl, mingw for windows)
+        run: |
+          # zig as a Linux linker — works for both musl arches with one tool,
+          # no per-arch gcc dance and no clash with the brew names used on the
+          # local dev box. `cargo zigbuild` wraps cargo and overrides whatever
+          # linker is set in .cargo/config.toml.
+          brew install zig mingw-w64
+
+      - name: Install packagers + zigbuild
+        run: |
+          cargo install --locked cargo-zigbuild
+          cargo install --locked cargo-deb
+          cargo install --locked cargo-generate-rpm
+
+      # ----------------------------------------------------------------------
+      # Compile binaries for every target. Done up-front so packaging steps
+      # below can all run with --no-build (cargo-deb/rpm) and just shrinkwrap.
+      # ----------------------------------------------------------------------
+
+      - name: Build macOS arm64
+        run: cargo build --release
+
+      - name: Cross-compile Linux x86_64 (musl, via zig)
+        run: cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+      - name: Cross-compile Linux aarch64 (musl, via zig)
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+      - name: Cross-compile Windows x86_64 (mingw)
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      # ----------------------------------------------------------------------
+      # macOS signing/notarization/stapling. The scripts pull creds from env
+      # JSON in CI (set as repo secrets) or from Vault in local dev.
+      # ----------------------------------------------------------------------
+
+      - name: Wrap in signed/notarized/stapled .pkg
+        env:
+          APPLE_ASC_JSON: ${{ secrets.APPLE_ASC_JSON }}
+          APPLE_INSTALLER_CERT_JSON: ${{ secrets.APPLE_INSTALLER_CERT_JSON }}
+        run: |
+          if [[ -z "$APPLE_ASC_JSON" || -z "$APPLE_INSTALLER_CERT_JSON" ]]; then
+            echo "::error::Missing Apple secrets. Set repo secrets APPLE_ASC_JSON and APPLE_INSTALLER_CERT_JSON. See .github/SECRETS.md."
+            exit 1
+          fi
+          ./build-pkg.sh target/release/apytti
+
+      - name: Build signed/notarized/stapled .dmg
+        env:
+          APPLE_ASC_JSON: ${{ secrets.APPLE_ASC_JSON }}
+          APPLE_APP_CERT_JSON: ${{ secrets.APPLE_APP_CERT_JSON }}
+        run: |
+          if [[ -z "$APPLE_ASC_JSON" || -z "$APPLE_APP_CERT_JSON" ]]; then
+            echo "::error::Missing Apple secrets. Set APPLE_ASC_JSON and APPLE_APP_CERT_JSON."
+            exit 1
+          fi
+          ./build-dmg.sh target/release/apytti
+
+      # ----------------------------------------------------------------------
+      # Linux packages. cargo-deb writes to target/<triple>/debian/,
+      # cargo-generate-rpm to target/<triple>/generate-rpm/. --auto-req
+      # disabled skips the ldd probe (would fail on macOS host).
+      # ----------------------------------------------------------------------
+
+      - name: Build .deb (x86_64)
+        run: cargo deb --no-build --target x86_64-unknown-linux-musl --no-strip
+
+      - name: Build .deb (aarch64)
+        run: cargo deb --no-build --target aarch64-unknown-linux-musl --no-strip
+
+      - name: Build .rpm (x86_64)
+        run: cargo generate-rpm --target x86_64-unknown-linux-musl --payload-compress none --auto-req disabled
+
+      - name: Build .rpm (aarch64)
+        run: cargo generate-rpm --target aarch64-unknown-linux-musl --payload-compress none --auto-req disabled
+
+      # ----------------------------------------------------------------------
+      # Portable archives.
+      # ----------------------------------------------------------------------
+
+      - name: Pack Linux tarballs
+        run: |
+          mkdir -p target/tarball
+          for triple in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            arch=$(echo "$triple" | cut -d- -f1)
+            stage="target/tarball/apytti-${VERSION}-linux-${arch}"
+            rm -rf "$stage"; mkdir -p "$stage"
+            cp "target/${triple}/release/apytti" "$stage/apytti"
+            cp README.md LICENSE "$stage/"
+            (cd target/tarball && tar -czf "apytti-${VERSION}-linux-${arch}.tar.gz" "apytti-${VERSION}-linux-${arch}")
+          done
+
+      - name: Pack Windows zip
+        run: |
+          mkdir -p target/zip
+          stage="target/zip/apytti-${VERSION}-windows-x86_64"
+          rm -rf "$stage"; mkdir -p "$stage"
+          cp target/x86_64-pc-windows-gnu/release/apytti.exe "$stage/"
+          cp README.md LICENSE "$stage/"
+          (cd target/zip && zip -r "apytti-${VERSION}-windows-x86_64.zip" "apytti-${VERSION}-windows-x86_64")
+
+      # ----------------------------------------------------------------------
+      # Stage all artifacts + checksums.
+      # ----------------------------------------------------------------------
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release
+          cp target/apytti-${VERSION}.pkg release/
+          cp target/apytti-${VERSION}.dmg release/
+          cp target/x86_64-unknown-linux-musl/debian/*.deb release/
+          cp target/aarch64-unknown-linux-musl/debian/*.deb release/
+          cp target/x86_64-unknown-linux-musl/generate-rpm/*.rpm release/
+          cp target/aarch64-unknown-linux-musl/generate-rpm/*.rpm release/
+          cp target/tarball/*.tar.gz release/
+          cp target/zip/*.zip release/
+          cp target/x86_64-pc-windows-gnu/release/apytti.exe release/apytti-${VERSION}-windows-x86_64.exe
+          (cd release && shasum -a 256 * > SHA256SUMS)
+          ls -lh release/
+
+      # ----------------------------------------------------------------------
+      # Publish. softprops/action-gh-release handles asset upload via the
+      # gh REST API + supports clobber-on-re-run for workflow_dispatch.
+      # ----------------------------------------------------------------------
+
+      - name: Compose release notes
+        id: notes
+        run: |
+          {
+            echo "notes<<NOTES_EOF"
+            echo "Automated release for ${{ steps.tag.outputs.ref }}."
+            echo ""
+            echo "**macOS (Apple Silicon)** — signed, notarized, stapled"
+            echo "- \`.pkg\` installs Apytti.app to /Applications and symlinks /usr/local/bin/apytti"
+            echo "- \`.dmg\` ships a standalone Apytti.app to drag into /Applications"
+            echo ""
+            echo "**Linux** — static musl binaries, no runtime deps"
+            echo "- \`.deb\` for Debian/Ubuntu (x86_64, aarch64)"
+            echo "- \`.rpm\` for Fedora/RHEL (x86_64, aarch64)"
+            echo "- \`.tar.gz\` portable for any distro"
+            echo ""
+            echo "**Windows** — mingw, no MSVC runtime needed"
+            echo "- \`.zip\` portable bundle"
+            echo "- standalone \`apytti-${VERSION}-windows-x86_64.exe\`"
+            echo ""
+            echo "See SHA256SUMS for integrity."
+            echo ""
+            echo "> Reminder: starting 2026-06-15 \`claude -p\` is billed separately from Pro/Max subscriptions. The Claude backend will cost API credits after that date — see README."
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.ref }}
+          name: ${{ steps.tag.outputs.ref }}
+          body: ${{ steps.notes.outputs.notes }}
+          files: release/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
