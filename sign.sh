@@ -49,7 +49,7 @@ if [[ ! -f "$KEY_PATH" ]]; then
     # CI path: the key file isn't on disk; pull it from the JSON's `.key`
     # field (CI sets it as plain text in APPLE_ASC_JSON).
     KEY_PATH="$WORKDIR/AuthKey.p8"
-    echo "$SECRET" | jq -r '.key // empty' > "$KEY_PATH"
+    echo "$SECRET" | jq -r '.key_p8 // .key // empty' > "$KEY_PATH"
     [[ -s "$KEY_PATH" ]] || { echo "fatal: notary key not on disk and not in JSON .key" >&2; exit 1; }
 fi
 

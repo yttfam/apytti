@@ -65,7 +65,7 @@ INSTALLER_P12_PW=$(echo "$INSTALLER" | jq -r '.p12_password')
 
 if [[ ! -f "$KEY_PATH" ]]; then
     KEY_PATH="$WORKDIR/AuthKey.p8"
-    echo "$ASC" | jq -r '.key // empty' > "$KEY_PATH"
+    echo "$ASC" | jq -r '.key_p8 // .key // empty' > "$KEY_PATH"
     [[ -s "$KEY_PATH" ]] || { echo "fatal: notary key not on disk and not in Vault"; exit 1; }
 fi
 
