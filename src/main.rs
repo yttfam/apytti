@@ -54,13 +54,26 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 /// Necessary on macOS where Finder/LaunchServices launches inherit a stripped
 /// PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) that doesn't include /opt/homebrew/bin
 /// or /usr/local/bin — which is where claude, copilot, gemini live after npm/brew.
+///
+/// `~/.local/bin` comes first: that's where the Linux claude installer drops its
+/// symlink, and neither a systemd unit's PATH nor a non-login shell's will
+/// necessarily carry it. Without this the gateway spawns `claude` and gets a bare
+/// ENOENT.
 fn augment_path() {
-    let extras = [
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-    ];
+    let mut extras: Vec<String> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        extras.push(home.join(".local/bin").to_string_lossy().into_owned());
+    }
+    extras.extend(
+        [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
     let current = std::env::var_os("PATH").unwrap_or_default();
     let current_str = current.to_string_lossy().into_owned();
     let mut prepend = Vec::new();
