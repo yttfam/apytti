@@ -173,17 +173,21 @@ pub fn install(args: &InstallArgs) -> anyhow::Result<()> {
 
     let user = std::env::var("USER").unwrap_or_else(|_| "cali".into());
     let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"));
-    let path = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
+    // `~/.local/bin` first — the Linux claude installer symlinks the binary there,
+    // and a systemd unit inherits none of the user's shell PATH. Omitting it means
+    // every spawn dies with a bare ENOENT.
+    let path =
+        format!("{home}/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin");
     let mut environment = format!(
-        "Environment=\"HOME={home}\"\n         \
-         Environment=\"USER={user}\"\n         \
-         Environment=\"PATH={path}\"\n         "
+        "Environment=\"HOME={home}\"\n\
+         Environment=\"USER={user}\"\n\
+         Environment=\"PATH={path}\"\n"
     );
     if let Some(url) = &args.hermytt_url {
-        environment.push_str(&format!("Environment=\"APYTTI_HERMYTT_URL={url}\"\n         "));
+        environment.push_str(&format!("Environment=\"APYTTI_HERMYTT_URL={url}\"\n"));
     }
     if let Some(token) = &args.hermytt_token {
-        environment.push_str(&format!("Environment=\"APYTTI_HERMYTT_TOKEN={token}\"\n         "));
+        environment.push_str(&format!("Environment=\"APYTTI_HERMYTT_TOKEN={token}\"\n"));
     }
 
     let content = format!(

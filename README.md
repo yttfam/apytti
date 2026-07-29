@@ -151,7 +151,7 @@ DELETE /backends/{name}/sessions/{sid}                   # delete
 ```json
 {
   "status": "ok",
-  "version": "0.6.8",
+  "version": "0.6.10",
   "active_backend": "claude",
   "enabled_backends": ["claude", "ollama"]
 }
