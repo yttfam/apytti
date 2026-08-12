@@ -43,6 +43,22 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "VERSION=$V" >> "$GITHUB_ENV"
 
+      # Every artifact name is built from Cargo.toml's version, but the release
+      # is addressed by the git tag. When they disagree the release silently
+      # ships mislabelled files — v0.6.9 shipped artifacts named 0.6.8 because
+      # the tag was cut without bumping Cargo.toml. Fail loudly instead.
+      - name: Guard — tag must match Cargo.toml version
+        run: |
+          TAG="${{ steps.tag.outputs.ref }}"
+          TAG_VERSION="${TAG#v}"
+          if [[ "$TAG_VERSION" != "$VERSION" ]]; then
+            echo "::error::tag/version mismatch — tag '$TAG' implies $TAG_VERSION but Cargo.toml says $VERSION."
+            echo "::error::Every artifact would be named apytti-$VERSION.* under a release called $TAG."
+            echo "::error::Fix: bump Cargo.toml to $TAG_VERSION and re-tag, or cut the tag as v$VERSION."
+            exit 1
+          fi
+          echo "tag $TAG matches Cargo.toml version $VERSION"
+
       # ----------------------------------------------------------------------
       # Toolchains. macos-14 ships rustup + xcode CLI tools + codesign +
       # productsign + pkgbuild + xcrun + hdiutil. Cross linkers + packagers

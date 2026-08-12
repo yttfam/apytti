@@ -17,6 +17,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
     let s_cancel_all = state.clone();
     let s_cancel_session = state.clone();
     let s_cancel_request = state.clone();
+    let s_update = state.clone();
+    let s_update_apply = state.clone();
 
     Router::new()
         .route(
@@ -33,6 +35,11 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             post(move |path| handler::cancel_request(s_cancel_request, path)),
         )
         .route("/health", get(move || handler::health(s_health)))
+        .route("/update", get(move |query| handler::get_update(s_update, query)))
+        .route(
+            "/update/apply",
+            post(move |headers| handler::post_update_apply(s_update_apply, headers)),
+        )
         .route("/help", get(handler::help))
         .route("/config-ui", get(handler::config_ui))
         .route("/config", get(move || handler::get_config(s_get_cfg)))
