@@ -73,6 +73,23 @@ pub struct AskRequest {
     pub extra_allow: Vec<String>,
 }
 
+/// Wrap a spawn/exec failure with the name of the binary we were trying to run.
+///
+/// Without this the caller sees a bare `No such file or directory (os error 2)`
+/// with no indication of *which* file — which is exactly what turned a missing
+/// `claude` on PATH into a long hunt. NotFound gets the PATH inlined, since a
+/// missing binary is almost always a PATH problem rather than a missing install.
+pub(crate) fn spawn_error(bin: &str, e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        let path = std::env::var("PATH").unwrap_or_else(|_| "<unset>".into());
+        anyhow::anyhow!(
+            "failed to spawn `{bin}`: not found on PATH — is it installed? (PATH={path})"
+        )
+    } else {
+        anyhow::anyhow!("failed to spawn `{bin}`: {e}")
+    }
+}
+
 /// Unified response shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -168,5 +185,22 @@ mod tests {
     #[test]
     fn backend_kind_all() {
         assert_eq!(BackendKind::ALL.len(), 4);
+    }
+
+    #[test]
+    fn spawn_error_not_found_names_binary_and_path() {
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg = spawn_error("claude", e).to_string();
+        assert!(msg.contains("`claude`"), "must name the binary: {msg}");
+        assert!(msg.contains("not found on PATH"), "must explain why: {msg}");
+        assert!(msg.contains("PATH="), "must inline PATH for diagnosis: {msg}");
+    }
+
+    #[test]
+    fn spawn_error_other_kinds_still_name_binary() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let msg = spawn_error("gemini", e).to_string();
+        assert!(msg.contains("`gemini`"), "must name the binary: {msg}");
+        assert!(msg.contains("denied"), "must keep the underlying cause: {msg}");
     }
 }

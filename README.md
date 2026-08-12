@@ -21,7 +21,7 @@ A unified REST gateway over Claude, Copilot, Gemini, and Ollama. One binary, one
 - Per-request backend / model / effort / dir / agent / command override
 - **SSE streaming** with normalized events (`delta`, `tool_use`, `tool_result`, `done`, `error`) across every backend
 - **Attachments** (`path` or base64 `data`) for images, audio, video, and documents — voice notes from Telegram-bridged agents Just Work
-- **Cancel endpoints**: `POST /backends/{name}/sessions/{sid}/cancel` for one session, `DELETE /api/ask` as kill switch — aborts drop the worker, `kill_on_drop(true)` SIGKILLs the subprocess
+- **Cancel endpoints**: `POST /backends/{name}/sessions/{sid}/cancel` for one session, `POST /requests/{request_id}/cancel` for one call (the only way to cancel a sessionless one), `DELETE /api/ask` as kill switch — aborts drop the worker, `kill_on_drop(true)` SIGKILLs the subprocess
 - **Sessions API**: list, inspect messages with `?since=N` for incremental polling, delete
 - **Config UI**: `/config-ui` is a self-contained HTML settings page for first-run setup without hermytt
 - Stateless gateway (sessions managed by the CLIs themselves; Ollama sessions kept in memory)
@@ -130,12 +130,20 @@ With `"stream": true` you get SSE instead — events are `delta`, `tool_use`, `t
 curl -X POST http://localhost:7781/backends/claude/sessions/<sid>/cancel
 # → {"killed": 1}
 
+# Cancel one call by caller-chosen request_id — works for sessionless calls
+curl -X POST http://localhost:7781/requests/flow-42-step-3/cancel
+# → {"killed": 1}
+
 # Kill switch — abort everything
 curl -X DELETE http://localhost:7781/api/ask
 # → {"killed": 3}
 ```
 
 Aborts drop the worker future; `kill_on_drop(true)` on every backend `Command` SIGKILLs the underlying subprocess.
+
+Pass `request_id` in the `/api/ask` body to make a call cancellable. Sessionless calls need it — without a `session_id` they're registered under an internal key the caller never sees, leaving `DELETE /api/ask` as the only alternative, which takes out unrelated work too.
+
+Note that dropping the HTTP connection cancels nothing: no part of the request path watches for client disconnect, so a client-side timeout leaves the subprocess running to completion. Call a cancel endpoint explicitly.
 
 ### Sessions
 
@@ -151,7 +159,7 @@ DELETE /backends/{name}/sessions/{sid}                   # delete
 ```json
 {
   "status": "ok",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "active_backend": "claude",
   "enabled_backends": ["claude", "ollama"]
 }
