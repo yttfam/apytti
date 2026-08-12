@@ -223,6 +223,10 @@ pub fn run(
                 tokio::spawn(registry::heartbeat_loop(hermytt, endpoint, version));
             }
 
+            // Self-update check runs on the .app install specifically — this is
+            // the path that can actually swap its own bundle.
+            tokio::spawn(crate::update::check_loop(state.update.clone(), port));
+
             let app = crate::build_router(state);
             let listener = match tokio::net::TcpListener::bind((bind_addr.as_str(), port)).await {
                 Ok(l) => l,

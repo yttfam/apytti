@@ -37,6 +37,8 @@ pub struct ServerState {
     pub in_flight: Mutex<HashMap<u64, InFlight>>,
     /// Monotonic counter for in_flight tokens.
     pub next_in_flight: std::sync::atomic::AtomicU64,
+    /// Latest self-update check result, refreshed by the background loop.
+    pub update: crate::update::SharedUpdateState,
 }
 
 #[derive(Debug)]
@@ -59,6 +61,7 @@ impl ServerState {
             session_locks: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             next_in_flight: std::sync::atomic::AtomicU64::new(1),
+            update: crate::update::initial_state(),
         }
     }
 
@@ -157,6 +160,10 @@ pub struct HealthResponse {
     pub version: &'static str,
     pub active_backend: Option<String>,
     pub enabled_backends: Vec<String>,
+    /// Present once a background update check has run. Omitted before the first
+    /// check so callers can tell "no update" from "haven't looked yet".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::update::UpdateStatus>,
 }
 
 pub async fn ask(
@@ -382,12 +389,67 @@ pub async fn health(state: Arc<ServerState>) -> Json<HealthResponse> {
         .map(|k| k.to_string())
         .collect();
 
+    let update = {
+        let u = state.update.read().await;
+        u.checked_at.is_some().then(|| u.clone())
+    };
+
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         active_backend,
         enabled_backends,
+        update,
     })
+}
+
+/// GET /update — current update status. Triggers a fresh check with `?check=true`.
+pub async fn get_update(
+    state: Arc<ServerState>,
+    axum::extract::Query(q): axum::extract::Query<UpdateQuery>,
+) -> Json<crate::update::UpdateStatus> {
+    if q.check.unwrap_or(false) {
+        return Json(crate::update::check_now(&state.update).await);
+    }
+    Json(state.update.read().await.clone())
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateQuery {
+    pub check: Option<bool>,
+}
+
+/// POST /update/apply — download, verify, swap in the latest release, restart.
+///
+/// Auth: same `X-Hermytt-Key` rule as the other mutating endpoints. This one
+/// replaces the running binary, so it is the most consequential write apytti
+/// exposes — never leave it open when a `config_token` is configured.
+///
+/// Responds *before* exiting: the swap is already done by the time this returns,
+/// and a detached helper restarts the new build (rolling back if it fails to come
+/// up healthy). The delay below is just enough for the response body to flush.
+pub async fn post_update_apply(
+    state: Arc<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_hermytt_key(&state, &headers).await?;
+
+    let version = crate::update::apply(&state.update)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("update failed: {e}")))?;
+
+    info!(version, "update applied — restarting into new build");
+
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        std::process::exit(0);
+    });
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "version": version,
+        "restarting": true,
+    })))
 }
 
 /// GET /config — returns the current PersistedConfig as JSON. Includes ALL four backends

@@ -27,6 +27,7 @@ A unified REST gateway over Claude, Copilot, Gemini, and Ollama. One binary, one
 - Stateless gateway (sessions managed by the CLIs themselves; Ollama sessions kept in memory)
 - Library API for Rust crates that want to call any backend programmatically
 - Daemon install for macOS (LaunchDaemon **or** signed/notarized `.app` bundle), Linux (systemd), Windows (sc)
+- **Self-update** for the macOS `.app`: hourly background check, `POST /update/apply` swaps the bundle with no admin prompt, verified against SHA-256 + Developer ID + pinned Team ID, with automatic rollback if the new build doesn't come up healthy
 
 ## Install
 
@@ -145,6 +146,20 @@ Pass `request_id` in the `/api/ask` body to make a call cancellable. Sessionless
 
 Note that dropping the HTTP connection cancels nothing: no part of the request path watches for client disconnect, so a client-side timeout leaves the subprocess running to completion. Call a cancel endpoint explicitly.
 
+### Self-update (macOS `.app` only)
+
+```bash
+curl http://localhost:7781/update                 # cached status
+curl 'http://localhost:7781/update?check=true'    # force a fresh check
+curl -X POST http://localhost:7781/update/apply   # verify, swap, restart
+```
+
+Checks run in the background hourly and never install anything on their own — applying is always an explicit call. No admin prompt: `/Applications` is group-`admin` writable and macOS doesn't stop an app replacing *itself*, so the pkg payload is unpacked and swapped in with atomic renames instead of running `installer`.
+
+Because `installer` isn't in the loop, nothing else validates the download, so apytti does it all itself first: SHA-256 against the release's `SHA256SUMS`, `codesign --verify --deep --strict`, Gatekeeper assessment, **Team ID pinned to `XJQQCN392F`**, and a bundle-identifier match against the running app. Any failure aborts and keeps the current version.
+
+The old bundle is kept as `Apytti.app.previous` until the new one answers `/health` with the expected version; if it doesn't within 60s, the previous build is restored automatically. The `.pkg` is still the first-install path — it lays the `/usr/local/bin/apytti` symlink and needs admin once.
+
 ### Sessions
 
 ```bash
@@ -159,7 +174,7 @@ DELETE /backends/{name}/sessions/{sid}                   # delete
 ```json
 {
   "status": "ok",
-  "version": "0.6.11",
+  "version": "0.6.12",
   "active_backend": "claude",
   "enabled_backends": ["claude", "ollama"]
 }

@@ -23,6 +23,21 @@ mod server;
 pub mod sessions;
 pub mod setup;
 pub mod stream;
+pub mod update;
+
+/// Port the HTTP server bound to, recorded at startup.
+///
+/// The self-update relaunch helper needs it to health-probe the new build, and
+/// that helper is generated after the port is long out of scope.
+static SERVER_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(7781);
+
+pub fn set_update_port(port: u16) {
+    SERVER_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn update_port() -> u16 {
+    SERVER_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[cfg(target_os = "macos")]
 pub mod macos_menu;

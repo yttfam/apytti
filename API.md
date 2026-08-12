@@ -2,7 +2,7 @@
 
 Quick contract for every endpoint. Updated on every endpoint change. **For prose docs see README.md, for the in-binary HTML view hit `GET /help`.**
 
-Version: **0.6.11**
+Version: **0.6.12**
 Default port: **7781**
 Base URL: `http://<host>:<port>`
 
@@ -144,6 +144,55 @@ curl -X POST localhost:7781/requests/flow-42-step-3/cancel
 Returns `{"killed": 0}` (with 200) when nothing matched — already finished, or never existed. Can exceed 1 if the same id was reused for concurrent calls. Cancelled callers get the same `400` + `error: "cancelled"` as the kill switch.
 
 **Note:** dropping the HTTP connection does *not* cancel anything. Nothing in the request path watches for client disconnect, so a client-side timeout leaves the subprocess running to completion (and billing). Call this endpoint explicitly.
+
+---
+
+## GET /update
+
+Status of the most recent self-update check. Add `?check=true` to force a fresh check instead of reading the cached result.
+
+```json
+{
+  "current": "0.6.12",
+  "latest": "0.6.13",
+  "available": true,
+  "supported": true,
+  "checked_at": "2026-08-12T13:46:41Z"
+}
+```
+
+`supported` is false when this install can't replace itself — anything that isn't the macOS `.app` bundle (cargo build, Homebrew, Linux daemon, Windows service). `error` is present instead of `latest` when the check failed.
+
+A background loop checks on startup and hourly thereafter, jittered by port so multiple instances don't stampede the GitHub API. Checking never installs anything.
+
+---
+
+## POST /update/apply
+
+Download, verify, and swap in the latest release, then restart into it.
+
+```json
+{ "ok": true, "version": "0.6.13", "restarting": true }
+```
+
+Auth: `X-Hermytt-Key` when `hermytt.config_token` is set. **This endpoint replaces the running binary — it is the most consequential write apytti exposes.** Don't leave it open on a shared network.
+
+Before anything touches `/Applications`, the download must pass *all* of:
+
+1. SHA-256 against the release's own `SHA256SUMS`
+2. `codesign --verify --deep --strict`
+3. Gatekeeper assessment (`spctl -a --type execute`)
+4. Team identifier pinned to `XJQQCN392F`
+5. Bundle identifier identical to the running app (a changed id would drop TCC grants and re-prompt)
+6. Bundle version matching the version the release claims
+
+Any failure aborts with a `400` and leaves the running version untouched. There is no "install anyway" path.
+
+The swap itself stages on the same volume and uses atomic renames: the current bundle becomes `Apytti.app.previous`, the staged one takes its place. A detached helper then restarts the app and probes `/health`; if the new build doesn't report the expected version within 60s it restores `.previous` and relaunches that instead. `.previous` is deleted only after the health check passes.
+
+`installer` is not involved, so no admin prompt appears. The `.pkg` remains the first-install path — it lays down the `/usr/local/bin/apytti` symlink and needs admin once. That symlink points at a path, not an inode, so it survives every subsequent swap.
+
+Returns `400` when already up to date, or when running outside a `.app` bundle.
 
 ---
 

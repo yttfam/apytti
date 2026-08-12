@@ -173,6 +173,7 @@ fn run_server(args: RunArgs, config_path: PathBuf) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         if !args.no_menu {
+            apytti::set_update_port(port);
             // Spawn the hermytt heartbeat from inside the worker (it needs the
             // tokio runtime). Pass via a helper that takes ServerState + the
             // hermytt config snapshot.
@@ -180,12 +181,15 @@ fn run_server(args: RunArgs, config_path: PathBuf) -> anyhow::Result<()> {
         }
     }
 
+    apytti::set_update_port(port);
+
     block_on(async move {
         if let Some(hermytt) = config.hermytt.clone() {
             let endpoint = registry::resolve_endpoint(&hermytt, port);
             let version = env!("CARGO_PKG_VERSION").to_string();
             tokio::spawn(registry::heartbeat_loop(hermytt, endpoint, version));
         }
+        tokio::spawn(apytti::update::check_loop(state.update.clone(), port));
         let app = apytti::build_router(state);
         let listener = tokio::net::TcpListener::bind((&*bind_addr, port))
             .await
