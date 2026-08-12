@@ -43,6 +43,11 @@ pub struct ServerState {
 pub struct InFlight {
     pub backend: String,
     pub sid: String,
+    /// Caller-supplied `request_id` from the /api/ask body, if any. Lets a
+    /// client cancel one specific call — including a sessionless one, which
+    /// `sid` cannot address because its key is a server-minted synthetic uuid
+    /// the caller never sees.
+    pub request_id: Option<String>,
     pub abort: tokio::task::AbortHandle,
 }
 
@@ -64,6 +69,7 @@ impl ServerState {
         &self,
         backend: &str,
         sid: &str,
+        request_id: Option<&str>,
         abort: tokio::task::AbortHandle,
     ) -> u64 {
         use std::sync::atomic::Ordering;
@@ -73,6 +79,7 @@ impl ServerState {
             InFlight {
                 backend: backend.to_string(),
                 sid: sid.to_string(),
+                request_id: request_id.map(String::from),
                 abort,
             },
         );
@@ -131,6 +138,17 @@ pub struct AskRequestBody {
     /// actual prompt. Slash-style command templating without needing claude's
     /// TUI to be running.
     pub command: Option<String>,
+    /// Caller-chosen id for this single call, used to cancel it via
+    /// `POST /requests/{request_id}/cancel`. The caller knows the value before
+    /// the request is sent, which is what makes it usable — the response body
+    /// only arrives once the call has already finished, so any server-minted id
+    /// returned there would be too late to cancel anything.
+    ///
+    /// Needed because sessionless calls are otherwise unaddressable: they're
+    /// registered under a synthetic `__nosession__<uuid>` key generated
+    /// server-side. Reusing the same value for two concurrent calls makes a
+    /// cancel abort both.
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -244,7 +262,12 @@ pub async fn ask(
     if body.stream {
         let (rx, abort) = dispatch_stream(kind, cfg, req);
         let token = state
-            .register_in_flight(kind.as_str(), &registry_sid, abort)
+            .register_in_flight(
+                kind.as_str(),
+                &registry_sid,
+                body.request_id.as_deref(),
+                abort,
+            )
             .await;
         let state_for_dereg = state.clone();
         let stream = sse_stream_from_rx(rx, move || {
@@ -265,7 +288,12 @@ pub async fn ask(
     let cfg_owned = cfg.clone();
     let join = tokio::spawn(async move { dispatch(kind, &cfg_owned, &req_owned).await });
     let token = state
-        .register_in_flight(kind.as_str(), &registry_sid, join.abort_handle())
+        .register_in_flight(
+            kind.as_str(),
+            &registry_sid,
+            body.request_id.as_deref(),
+            join.abort_handle(),
+        )
         .await;
     let outcome = join.await;
     state.unregister_in_flight(token).await;
@@ -699,6 +727,40 @@ pub async fn cancel_backend_session(
     Ok(Json(serde_json::json!({ "killed": killed })))
 }
 
+/// POST /requests/{request_id}/cancel — abort the in-flight /api/ask call(s)
+/// that were submitted with this `request_id`.
+///
+/// This is the only way to cancel a sessionless call: without a `session_id`
+/// the call is registered under a server-minted `__nosession__<uuid>` the
+/// caller never learns, so `POST /backends/{name}/sessions/{sid}/cancel` can't
+/// address it and `DELETE /api/ask` is a kill switch that takes out unrelated
+/// concurrent work too.
+///
+/// Backend-agnostic: a request_id is chosen by the caller and assumed unique,
+/// so there's no need to disambiguate by backend. Returns `{"killed": N}`;
+/// N is 0 when nothing matched (already finished, or never existed), and can
+/// exceed 1 if the caller reused the same id for concurrent calls.
+pub async fn cancel_request(
+    state: Arc<ServerState>,
+    Path(request_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let mut registry = state.in_flight.lock().await;
+    let to_remove: Vec<u64> = registry
+        .iter()
+        .filter(|(_, e)| e.request_id.as_deref() == Some(request_id.as_str()))
+        .map(|(t, _)| *t)
+        .collect();
+    let mut killed = 0usize;
+    for token in to_remove {
+        if let Some(entry) = registry.remove(&token) {
+            entry.abort.abort();
+            killed += 1;
+        }
+    }
+    info!(request_id, killed, "cancel by request id");
+    Ok(Json(serde_json::json!({ "killed": killed })))
+}
+
 /// DELETE /api/ask — kill switch. Aborts every in-flight /api/ask call.
 /// Returns `{"killed": N}`.
 pub async fn cancel_all_ask(
@@ -850,6 +912,107 @@ mod tests {
         assert_eq!(req.prompt, "hello");
         assert!(req.session_id.is_none());
         assert!(req.backend.is_none());
+    }
+
+    #[test]
+    fn deserialize_ask_request_with_request_id() {
+        let json = r#"{"prompt": "hi", "request_id": "req-1"}"#;
+        let req: AskRequestBody = serde_json::from_str(json).unwrap();
+        assert_eq!(req.request_id.as_deref(), Some("req-1"));
+    }
+
+    #[test]
+    fn request_id_absent_by_default() {
+        let req: AskRequestBody = serde_json::from_str(r#"{"prompt": "hi"}"#).unwrap();
+        assert!(req.request_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_flight_registry_tracks_request_id() {
+        let state = Arc::new(ServerState::new(
+            PersistedConfig::default(),
+            PathBuf::from("/tmp/none.toml"),
+        ));
+
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        let token = state
+            .register_in_flight("claude", "__nosession__x", Some("req-9"), task.abort_handle())
+            .await;
+
+        {
+            let reg = state.in_flight.lock().await;
+            let entry = reg.get(&token).expect("entry registered");
+            assert_eq!(entry.request_id.as_deref(), Some("req-9"));
+            assert_eq!(entry.sid, "__nosession__x");
+        }
+
+        state.unregister_in_flight(token).await;
+        assert!(state.in_flight.lock().await.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_request_only_kills_matching_id() {
+        let state = Arc::new(ServerState::new(
+            PersistedConfig::default(),
+            PathBuf::from("/tmp/none.toml"),
+        ));
+
+        let keep = tokio::spawn(async { std::future::pending::<()>().await });
+        let drop_me = tokio::spawn(async { std::future::pending::<()>().await });
+        state
+            .register_in_flight("claude", "s1", Some("keep-me"), keep.abort_handle())
+            .await;
+        state
+            .register_in_flight("claude", "s2", Some("kill-me"), drop_me.abort_handle())
+            .await;
+
+        let out = cancel_request(state.clone(), Path("kill-me".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(out.0["killed"], 1);
+
+        let reg = state.in_flight.lock().await;
+        assert_eq!(reg.len(), 1, "only the matching entry is removed");
+        assert_eq!(reg.values().next().unwrap().request_id.as_deref(), Some("keep-me"));
+        drop(reg);
+        keep.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_request_no_match_is_zero() {
+        let state = Arc::new(ServerState::new(
+            PersistedConfig::default(),
+            PathBuf::from("/tmp/none.toml"),
+        ));
+        let out = cancel_request(state, Path("nobody".to_string())).await.unwrap();
+        assert_eq!(out.0["killed"], 0);
+    }
+
+    #[tokio::test]
+    async fn sessionless_calls_are_not_addressable_by_session_cancel() {
+        // The reason request_id exists: the synthetic sid never leaves the
+        // process, so a caller cannot construct it to cancel their own call.
+        let state = Arc::new(ServerState::new(
+            PersistedConfig::default(),
+            PathBuf::from("/tmp/none.toml"),
+        ));
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        state
+            .register_in_flight("claude", "__nosession__deadbeef", Some("r1"), task.abort_handle())
+            .await;
+
+        let out = cancel_backend_session(
+            state.clone(),
+            Path(("claude".to_string(), "__nosession__guess".to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["killed"], 0, "guessing the synthetic sid must not work");
+
+        let out = cancel_request(state, Path("r1".to_string())).await.unwrap();
+        assert_eq!(out.0["killed"], 1, "request_id addresses it");
+        task.abort();
     }
 
     #[test]

@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::{AskRequest, Response};
+use super::{spawn_error, AskRequest, Response};
 use crate::persist::BackendConfig;
 use crate::stream::StreamEvent;
 
@@ -55,7 +55,7 @@ pub fn extract_json(stdout: &str) -> Option<&str> {
 
 pub async fn ask(cfg: &BackendConfig, req: &AskRequest) -> anyhow::Result<Response> {
     let mut cmd = build_command(cfg, req);
-    let output = cmd.output().await?;
+    let output = cmd.output().await.map_err(|e| spawn_error("gemini", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,7 +118,7 @@ pub async fn ask_stream(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().map_err(|e| spawn_error("gemini", e))?;
     let stdout = child
         .stdout
         .take()

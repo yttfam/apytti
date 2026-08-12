@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::{AskRequest, Response};
+use super::{spawn_error, AskRequest, Response};
 use crate::persist::BackendConfig;
 use crate::stream::StreamEvent;
 
@@ -71,7 +71,7 @@ pub fn build_command(cfg: &BackendConfig, req: &AskRequest) -> Command {
 
 pub async fn ask(cfg: &BackendConfig, req: &AskRequest) -> anyhow::Result<Response> {
     let mut cmd = build_command(cfg, req);
-    let output = cmd.output().await?;
+    let output = cmd.output().await.map_err(|e| spawn_error("claude", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -122,7 +122,7 @@ pub async fn ask_stream(
     // Override output-format to stream-json. claude requires --verbose with stream-json.
     cmd.arg("--output-format").arg("stream-json").arg("--verbose");
 
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().map_err(|e| spawn_error("claude", e))?;
     let stdout = child
         .stdout
         .take()

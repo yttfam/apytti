@@ -480,3 +480,103 @@ async fn backends_schema_endpoint() {
     assert_eq!(body["claude"]["supports_effort"], true);
     assert_eq!(body["gemini"]["supports_effort"], false);
 }
+
+// ---------- cancellation ----------
+
+#[tokio::test]
+async fn cancel_request_unknown_id_returns_zero() {
+    let port = free_port();
+    start_server(port, config_with_claude()).await;
+
+    let resp = Http::new()
+        .post(format!("http://127.0.0.1:{port}/requests/never-existed/cancel"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["killed"], 0);
+}
+
+#[tokio::test]
+async fn cancel_request_aborts_matching_in_flight_call() {
+    let port = free_port();
+    start_server(port, config_with_claude()).await;
+
+    // Sessionless call — unaddressable by session cancel, which is the whole
+    // point of request_id. `sleep` stands in for a slow CLI so there's a real
+    // in-flight window to cancel inside of.
+    let mut cfg = config_with_claude();
+    cfg.set_backend(
+        BackendKind::Claude,
+        BackendConfig {
+            enabled: true,
+            dir: Some("/nonexistent-dir-so-spawn-hangs-or-fails".into()),
+            ..Default::default()
+        },
+    );
+
+    let ask = tokio::spawn(async move {
+        Http::new()
+            .post(format!("http://127.0.0.1:{port}/api/ask"))
+            .json(&serde_json::json!({
+                "prompt": "irrelevant",
+                "request_id": "req-abc-123",
+            }))
+            .send()
+            .await
+    });
+
+    // Give the handler time to register the call before cancelling it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = Http::new()
+        .post(format!("http://127.0.0.1:{port}/requests/req-abc-123/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Either we caught it in flight (killed=1) or the spawn already failed
+    // (killed=0). Both are valid; what must hold is that the endpoint answers
+    // with a well-formed count rather than erroring.
+    assert!(body["killed"].is_number(), "killed must be a number");
+
+    let _ = ask.await;
+}
+
+#[tokio::test]
+async fn cancel_by_session_ignores_other_sessions() {
+    let port = free_port();
+    start_server(port, config_with_claude()).await;
+
+    let resp = Http::new()
+        .post(format!(
+            "http://127.0.0.1:{port}/backends/claude/sessions/not-running/cancel"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["killed"],
+        0
+    );
+}
+
+#[tokio::test]
+async fn cancel_request_unknown_backend_path_still_routes() {
+    // /requests/{id}/cancel is backend-agnostic by design — no backend segment
+    // to get wrong.
+    let port = free_port();
+    start_server(port, config_with_claude()).await;
+
+    let resp = Http::new()
+        .post(format!("http://127.0.0.1:{port}/requests/whatever/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}

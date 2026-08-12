@@ -2,7 +2,7 @@
 
 Quick contract for every endpoint. Updated on every endpoint change. **For prose docs see README.md, for the in-binary HTML view hit `GET /help`.**
 
-Version: **0.6.0**
+Version: **0.6.11**
 Default port: **7781**
 Base URL: `http://<host>:<port>`
 
@@ -40,6 +40,7 @@ Send a prompt to a backend.
   "stream": false,                            // optional, returns SSE if true
   "agent": "infrakid",                        // optional (claude only) — passes --agent <name>
   "command": "review",                        // optional (claude only) — expand ~/.claude/commands/review.md, $ARGUMENTS = prompt
+  "request_id": "flow-42-step-3",             // optional — makes this call cancellable via POST /requests/{request_id}/cancel
   "attachments": [                            // optional; one of `path` OR `data` per entry
     { "path": "/abs/path/kitchen.jpg", "kind": "image", "name": "kitchen.jpg" },
     { "data": "<base64>",              "kind": "image", "name": "selfie.jpg"  },
@@ -111,13 +112,38 @@ Cancelled non-streaming callers receive a `400` with `error: "cancelled"`. Strea
 
 ## POST /backends/{name}/sessions/{sid}/cancel
 
-Cancel any in-flight `/api/ask` call(s) for this `(backend, session_id)`. Sessionless calls aren't matched here — use `DELETE /api/ask` for those.
+Cancel any in-flight `/api/ask` call(s) for this `(backend, session_id)`. Sessionless calls aren't matched here — give them a `request_id` and use `POST /requests/{request_id}/cancel`.
 
 ```json
 { "killed": 1 }
 ```
 
 Returns `{"killed": 0}` (with 200) if nothing was in flight.
+
+---
+
+## POST /requests/{request_id}/cancel
+
+Cancel the in-flight `/api/ask` call(s) submitted with this `request_id`. Backend-agnostic — the id is caller-chosen and assumed unique, so there's no backend segment in the path.
+
+```json
+{ "killed": 1 }
+```
+
+This is the only way to cancel a **sessionless** call. Without a `session_id`, apytti registers the call under a server-minted `__nosession__<uuid>` key that never leaves the process, so the caller can't construct it; `DELETE /api/ask` would work but takes out unrelated concurrent calls too.
+
+Pass `request_id` in the `POST /api/ask` body to make a call addressable. The caller picks the value **before** sending, which is what makes it usable — the response body only arrives once the call has finished, so any id returned there would be too late to cancel anything.
+
+```bash
+curl -X POST localhost:7781/api/ask -H 'Content-Type: application/json' \
+  -d '{"prompt": "...", "request_id": "flow-42-step-3"}' &
+curl -X POST localhost:7781/requests/flow-42-step-3/cancel
+# → {"killed": 1}
+```
+
+Returns `{"killed": 0}` (with 200) when nothing matched — already finished, or never existed. Can exceed 1 if the same id was reused for concurrent calls. Cancelled callers get the same `400` + `error: "cancelled"` as the kill switch.
+
+**Note:** dropping the HTTP connection does *not* cancel anything. Nothing in the request path watches for client disconnect, so a client-side timeout leaves the subprocess running to completion (and billing). Call this endpoint explicitly.
 
 ---
 
