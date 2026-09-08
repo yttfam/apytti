@@ -61,6 +61,8 @@ apytti run --port 7781       # explicit
 apytti setup                 # interactive backend config
 apytti install               # generate OS daemon (launchd/systemd/sc)
 apytti uninstall             # remove daemon
+apytti status                # daemon install + running state, as JSON
+apytti init-models           # probe enabled backends, cache to ~/.apytti/models.json
 apytti --help                # full reference
 ```
 
@@ -73,6 +75,7 @@ apytti run [OPTIONS]
   --host <HOST>      Bind address (default: 0.0.0.0)
   --localhost        Bind to 127.0.0.1 only
   --verbose          Log requests + responses + timing
+  --no-menu          macOS: skip the menu-bar wrapper, run headless (dev/test)
 ```
 
 Override config path with `--config <PATH>` at any subcommand.
@@ -100,8 +103,10 @@ Request:
   "model": "sonnet",
   "effort": "low",
   "stream": false,
+  "dir": "/srv/project-foo",
   "agent": "infrakid",
   "command": "review",
+  "request_id": "flow-42-step-3",
   "attachments": [
     { "path": "/abs/path/kitchen.jpg", "kind": "image" },
     { "data": "<base64>",              "kind": "audio", "name": "voice.ogg" }
@@ -176,9 +181,18 @@ DELETE /backends/{name}/sessions/{sid}                   # delete
   "status": "ok",
   "version": "0.6.12",
   "active_backend": "claude",
-  "enabled_backends": ["claude", "ollama"]
+  "enabled_backends": ["claude", "ollama"],
+  "update": {
+    "current": "0.6.12",
+    "latest": "0.6.12",
+    "available": false,
+    "supported": true,
+    "checked_at": "2026-08-14T09:12:03Z"
+  }
 }
 ```
+
+The `update` block appears once a self-update check has run, so callers can tell "no update" from "haven't looked yet".
 
 ### GET /help
 
