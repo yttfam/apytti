@@ -67,6 +67,15 @@ pub struct BackendConfig {
     pub allow: Vec<String>,
     #[serde(default = "default_resume")]
     pub resume: bool,
+    /// Hard deadline for one call to this backend, in seconds. On expiry the
+    /// worker is aborted (SIGKILLing the subprocess via kill_on_drop) and the
+    /// caller gets 504.
+    ///
+    /// Without this a hung CLI holds the per-session mutex forever and every
+    /// later call to that session_id blocks silently behind it. Defaults to
+    /// DEFAULT_TIMEOUT_SECS; generous on purpose, since agentic turns can
+    /// legitimately run for minutes — it is a deadlock guard, not a latency SLA.
+    pub timeout_secs: Option<u64>,
 
     // Ollama-specific
     pub endpoint: Option<String>,

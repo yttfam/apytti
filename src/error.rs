@@ -5,6 +5,9 @@ use axum::response::{IntoResponse, Response};
 pub enum AppError {
     Internal(String),
     BadRequest(String),
+    /// A backend call exceeded its deadline and was aborted. Distinct from
+    /// BadRequest because the caller did nothing wrong and a retry may work.
+    Timeout(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -12,6 +15,7 @@ impl std::fmt::Display for AppError {
         match self {
             AppError::Internal(msg) => write!(f, "internal error: {msg}"),
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
+            AppError::Timeout(msg) => write!(f, "timeout: {msg}"),
         }
     }
 }
@@ -21,6 +25,7 @@ impl IntoResponse for AppError {
         let (status, message) = match &self {
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, msg.clone()),
         };
 
         let body = serde_json::json!({

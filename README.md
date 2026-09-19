@@ -107,6 +107,7 @@ Request:
   "agent": "infrakid",
   "command": "review",
   "request_id": "flow-42-step-3",
+  "timeout_secs": 900,
   "attachments": [
     { "path": "/abs/path/kitchen.jpg", "kind": "image" },
     { "data": "<base64>",              "kind": "audio", "name": "voice.ogg" }
@@ -151,6 +152,14 @@ Pass `request_id` in the `/api/ask` body to make a call cancellable. Sessionless
 
 Note that dropping the HTTP connection cancels nothing: no part of the request path watches for client disconnect, so a client-side timeout leaves the subprocess running to completion. Call a cancel endpoint explicitly.
 
+### Timeouts
+
+Every call has a deadline — `timeout_secs` on the request, else the backend's `timeout_secs`, else **900s**. It covers the whole call (queueing for the session lock *and* the backend run); on expiry the worker is aborted, the CLI is SIGKILLed, and the caller gets `504`.
+
+It exists because the per-session mutex is only released when the handler returns. A CLI that *fails* releases it fine; one that *hangs* never did — so a single stuck call used to wedge every later request to that `session_id` silently and indefinitely. The default is generous on purpose: this is a deadlock guard, not a latency policy.
+
+If you are queued behind a stuck call, the `504` names the cancel endpoint that clears it.
+
 ### Self-update (macOS `.app` only)
 
 ```bash
@@ -179,7 +188,7 @@ DELETE /backends/{name}/sessions/{sid}                   # delete
 ```json
 {
   "status": "ok",
-  "version": "0.6.12",
+  "version": "0.6.13",
   "active_backend": "claude",
   "enabled_backends": ["claude", "ollama"],
   "update": {
