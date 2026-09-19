@@ -2,7 +2,7 @@
 
 Quick contract for every endpoint. Updated on every endpoint change. **For prose docs see README.md, for the in-binary HTML view hit `GET /help`.**
 
-Version: **0.6.12**
+Version: **0.6.13**
 Default port: **7781**
 Base URL: `http://<host>:<port>`
 
@@ -41,6 +41,7 @@ Send a prompt to a backend.
   "agent": "infrakid",                        // optional (claude only) — passes --agent <name>
   "command": "review",                        // optional (claude only) — expand ~/.claude/commands/review.md, $ARGUMENTS = prompt
   "request_id": "flow-42-step-3",             // optional — makes this call cancellable via POST /requests/{request_id}/cancel
+  "timeout_secs": 900,                        // optional — deadline for this call; falls back to the backend's timeout_secs, then 900
   "attachments": [                            // optional; one of `path` OR `data` per entry
     { "path": "/abs/path/kitchen.jpg", "kind": "image", "name": "kitchen.jpg" },
     { "data": "<base64>",              "kind": "image", "name": "selfie.jpg"  },
@@ -57,6 +58,15 @@ Send a prompt to a backend.
 Apytti prepends a reference line per attachment to the prompt (`[attached <kind>: <name> -> <path>]`) and, for the claude CLI backend, mints a per-call `--allowedTools Read(<path>)` rule so the file is readable without `--dangerously-skip-permissions`. Per-call scope only — never persisted to `~/.apytti/config.toml`.
 
 **Security gate** (optional, `path` form only): set `[security] attachment_roots = ["/tmp/pyttch-bridge", ...]` in the persisted config to require every `attachments[].path` live inside one of those roots. The `data` form is unaffected — apytti owns the write location. Unset = no whitelist enforcement (existence/regular-file checks still apply to `path`).
+
+**Timeouts.** Every call has a deadline: `timeout_secs` on the request, else the backend's `timeout_secs` in config, else **900s**. It bounds the *whole* call — waiting for the session lock plus the backend run — and on expiry apytti aborts the worker (SIGKILLing the CLI via `kill_on_drop`) and returns **`504`**.
+
+This is a deadlock guard, not a latency policy. Without it a hung CLI holds the per-session mutex forever and every later call to that `session_id` blocks silently behind it, with no response at all. The generous default is deliberate — agentic turns legitimately run for minutes.
+
+Two distinguishable `504`s:
+
+- `backend {kind} exceeded its {n}s deadline and was aborted` — this call's own run ran long.
+- `another call to session {sid} … is still running after {n}s; cancel it via POST /backends/{kind}/sessions/{sid}/cancel` — you were queued behind a stuck predecessor, and the message names the way out.
 
 **Response (non-streaming)** — `application/json`:
 ```json

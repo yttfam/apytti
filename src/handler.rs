@@ -152,6 +152,29 @@ pub struct AskRequestBody {
     /// server-side. Reusing the same value for two concurrent calls makes a
     /// cancel abort both.
     pub request_id: Option<String>,
+    /// Per-call deadline override in seconds. Falls back to the backend's
+    /// `timeout_secs`, then to `DEFAULT_TIMEOUT_SECS`. Bounds the whole call —
+    /// waiting for the session lock plus the backend run — so a caller's stated
+    /// patience is the real ceiling.
+    pub timeout_secs: Option<u64>,
+}
+
+/// Deadline applied when neither the request nor the backend config sets one.
+///
+/// Deliberately generous: agentic turns legitimately run for minutes, so this is
+/// a deadlock guard, not a latency policy. Its job is to guarantee the
+/// per-session mutex is always released eventually — before this existed, one
+/// hung CLI wedged every later call to that session_id, silently and forever.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
+
+// Compile-time guard against someone "tightening" the default into a latency
+// policy. It is a deadlock guard; agentic turns legitimately run for minutes.
+const _: () = assert!(DEFAULT_TIMEOUT_SECS >= 600);
+
+/// Precedence for a call's deadline: request override, then backend config, then
+/// the built-in default.
+pub fn resolve_timeout_secs(request: Option<u64>, backend: Option<u64>) -> u64 {
+    request.or(backend).unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -247,6 +270,13 @@ pub async fn ask(
         extra_allow,
     };
 
+    // One deadline for the whole call: queueing behind a same-session predecessor
+    // plus the backend run itself. Bounding only the run would let a caller sit
+    // forever behind someone else's stuck request, which is the failure mode this
+    // exists to kill.
+    let timeout_secs = resolve_timeout_secs(body.timeout_secs, cfg.timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
     // Acquire per-(backend, dir, sid) mutex if a session_id is set — serializes
     // concurrent calls from apytti to the same session. External processes are NOT
     // covered (use GET /backends/{name}/sessions/{sid}/status to detect those).
@@ -254,7 +284,21 @@ pub async fn ask(
         let lock = state
             .session_lock(kind.as_str(), req.dir.as_deref(), sid)
             .await;
-        Some(lock.lock_owned().await)
+        match tokio::time::timeout_at(deadline, lock.lock_owned()).await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                warn!(
+                    backend = kind.as_str(),
+                    session_id = sid,
+                    timeout_secs,
+                    "timed out waiting for the session lock"
+                );
+                return Err(AppError::Timeout(format!(
+                    "another call to session {sid} on backend {kind} is still running \
+                     after {timeout_secs}s; cancel it via POST /backends/{kind}/sessions/{sid}/cancel"
+                )));
+            }
+        }
     } else {
         None
     };
@@ -277,7 +321,14 @@ pub async fn ask(
             )
             .await;
         let state_for_dereg = state.clone();
+        // Hand the session guard to the stream so it lives exactly as long as the
+        // stream does. Letting it drop at the end of this function released the
+        // lock the instant the SSE response was built, so streaming calls never
+        // actually serialised against each other. Dropping the closure without
+        // calling it (client hung up mid-stream) still frees the guard.
+        let guard = _lock_guard;
         let stream = sse_stream_from_rx(rx, move || {
+            drop(guard);
             let s = state_for_dereg.clone();
             tokio::spawn(async move { s.unregister_in_flight(token).await });
         });
@@ -294,22 +345,38 @@ pub async fn ask(
     let req_owned = req.clone();
     let cfg_owned = cfg.clone();
     let join = tokio::spawn(async move { dispatch(kind, &cfg_owned, &req_owned).await });
+    let abort = join.abort_handle();
     let token = state
         .register_in_flight(
             kind.as_str(),
             &registry_sid,
             body.request_id.as_deref(),
-            join.abort_handle(),
+            abort.clone(),
         )
         .await;
-    let outcome = join.await;
+    let outcome = tokio::time::timeout_at(deadline, join).await;
     state.unregister_in_flight(token).await;
     let resp = match outcome {
-        Ok(resp) => resp,
-        Err(e) if e.is_cancelled() => {
+        Err(_elapsed) => {
+            // Abort drops the worker future, which drops the Child; kill_on_drop
+            // then SIGKILLs the CLI so it can't keep running (and billing) unseen.
+            // This also releases the session mutex, which is the whole point.
+            abort.abort();
+            warn!(
+                backend = kind.as_str(),
+                session_id = registry_sid.as_str(),
+                timeout_secs,
+                "call exceeded its deadline — worker aborted"
+            );
+            return Err(AppError::Timeout(format!(
+                "backend {kind} exceeded its {timeout_secs}s deadline and was aborted"
+            )));
+        }
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) if e.is_cancelled() => {
             return Err(AppError::BadRequest("cancelled".into()));
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             return Err(AppError::Internal(format!("dispatch task failed: {e}")));
         }
     };
@@ -974,6 +1041,28 @@ mod tests {
         assert_eq!(req.prompt, "hello");
         assert!(req.session_id.is_none());
         assert!(req.backend.is_none());
+    }
+
+    #[test]
+    fn timeout_precedence_request_wins() {
+        assert_eq!(resolve_timeout_secs(Some(5), Some(60)), 5);
+    }
+
+    #[test]
+    fn timeout_falls_back_to_backend_config() {
+        assert_eq!(resolve_timeout_secs(None, Some(60)), 60);
+    }
+
+    #[test]
+    fn timeout_falls_back_to_default() {
+        assert_eq!(resolve_timeout_secs(None, None), DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn deserialize_ask_request_with_timeout() {
+        let req: AskRequestBody =
+            serde_json::from_str(r#"{"prompt":"hi","timeout_secs":30}"#).unwrap();
+        assert_eq!(req.timeout_secs, Some(30));
     }
 
     #[test]

@@ -580,3 +580,247 @@ async fn cancel_request_unknown_backend_path_still_routes() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 }
+
+// ---------- timeouts / session-lock release ----------
+
+/// A server that accepts TCP connections and then never answers — stands in for a
+/// backend that hangs rather than failing, which is the case that used to wedge a
+/// session permanently.
+async fn blackhole_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        // Hold every socket open, write nothing, ever.
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+fn config_with_hung_ollama(endpoint: String) -> PersistedConfig {
+    let mut cfg = PersistedConfig::default();
+    cfg.active = Some(BackendKind::Ollama);
+    cfg.set_backend(
+        BackendKind::Ollama,
+        BackendConfig {
+            enabled: true,
+            endpoint: Some(endpoint),
+            ..Default::default()
+        },
+    );
+    cfg
+}
+
+#[tokio::test]
+async fn hung_backend_times_out_with_504() {
+    let port = free_port();
+    let endpoint = blackhole_endpoint().await;
+    start_server(port, config_with_hung_ollama(endpoint)).await;
+
+    let resp = Http::new()
+        .post(format!("http://127.0.0.1:{port}/api/ask"))
+        .json(&serde_json::json!({"prompt": "hello", "timeout_secs": 1}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 504, "a hung backend must return Gateway Timeout");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("deadline"),
+        "error should explain the deadline: {body}"
+    );
+}
+
+/// The regression test for the bug that wedged Lou: before the fix, the first
+/// call's guard was never released (the handler never returned), so every later
+/// call to the same session_id blocked forever on the mutex with no response at
+/// all. Now the first call times out, frees the lock, and the second gets its own
+/// timely answer instead of silence.
+#[tokio::test]
+async fn timed_out_call_releases_the_session_lock() {
+    let port = free_port();
+    let endpoint = blackhole_endpoint().await;
+    start_server(port, config_with_hung_ollama(endpoint)).await;
+
+    let body = serde_json::json!({
+        "prompt": "hello",
+        "session_id": "stuck-session",
+        "timeout_secs": 1
+    });
+
+    let first = Http::new()
+        .post(format!("http://127.0.0.1:{port}/api/ask"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 504);
+
+    // The second call must come back promptly. If the lock leaked it would hang
+    // until this client's own timeout, so bound it and fail loudly.
+    let second = tokio::time::timeout(
+        Duration::from_secs(20),
+        Http::new()
+            .post(format!("http://127.0.0.1:{port}/api/ask"))
+            .json(&body)
+            .send(),
+    )
+    .await
+    .expect("second call hung — the session lock was not released")
+    .unwrap();
+
+    assert_eq!(
+        second.status(),
+        504,
+        "second call should hit its own deadline, not inherit a leaked lock"
+    );
+}
+
+#[tokio::test]
+async fn queued_caller_gets_504_not_silence_when_predecessor_is_stuck() {
+    let port = free_port();
+    let endpoint = blackhole_endpoint().await;
+    start_server(port, config_with_hung_ollama(endpoint)).await;
+
+    let mk = |secs: u64| {
+        serde_json::json!({"prompt": "x", "session_id": "shared", "timeout_secs": secs})
+    };
+
+    // Long-running holder, then a short-patience caller queued behind it.
+    let holder = tokio::spawn({
+        let url = format!("http://127.0.0.1:{port}/api/ask");
+        async move { Http::new().post(url).json(&mk(12)).send().await }
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let queued = tokio::time::timeout(
+        Duration::from_secs(15),
+        Http::new()
+            .post(format!("http://127.0.0.1:{port}/api/ask"))
+            .json(&mk(2))
+            .send(),
+    )
+    .await
+    .expect("queued caller never got a response")
+    .unwrap();
+
+    assert_eq!(queued.status(), 504, "waiting on the lock must be bounded too");
+    let body: serde_json::Value = queued.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("cancel"),
+        "the error should tell the caller how to clear it: {body}"
+    );
+
+    let _ = holder.await;
+}
+
+/// A minimal stand-in for Ollama that answers immediately, so the happy path can
+/// be exercised without a real backend.
+async fn fake_ollama() -> String {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/api/chat",
+        post(|| async {
+            axum::Json(serde_json::json!({
+                "model": "fake",
+                "message": {"role": "assistant", "content": "pong"},
+                "done": true
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", addr.port())
+}
+
+/// The happy path must not deadlock: the guard has to be released on success just
+/// as reliably as on timeout, or the fix would trade one wedge for another.
+#[tokio::test]
+async fn successful_call_releases_lock_for_the_next_one() {
+    let port = free_port();
+    let endpoint = fake_ollama().await;
+    let mut cfg = PersistedConfig::default();
+    cfg.active = Some(BackendKind::Ollama);
+    cfg.set_backend(
+        BackendKind::Ollama,
+        BackendConfig {
+            enabled: true,
+            endpoint: Some(endpoint),
+            ..Default::default()
+        },
+    );
+    start_server(port, cfg).await;
+
+    let body = serde_json::json!({"prompt": "ping", "session_id": "reused"});
+    for attempt in 1..=3 {
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            Http::new()
+                .post(format!("http://127.0.0.1:{port}/api/ask"))
+                .json(&body)
+                .send(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("call {attempt} hung — lock not released by the previous one"))
+        .unwrap();
+
+        assert_eq!(resp.status(), 200, "call {attempt} should succeed");
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["response"], "pong", "call {attempt}");
+        assert!(v["error"].is_null(), "call {attempt} should carry no error");
+    }
+}
+
+/// Streaming used to drop the session guard as soon as the SSE response was
+/// built, so streaming calls never actually serialised. With the guard handed to
+/// the stream, a second call to the same session queues behind it — and the 504
+/// it eventually gets must name the *lock*, not its own dispatch deadline.
+#[tokio::test]
+async fn streaming_call_holds_the_session_lock_while_it_streams() {
+    let port = free_port();
+    let endpoint = blackhole_endpoint().await;
+    start_server(port, config_with_hung_ollama(endpoint)).await;
+
+    let streamer = tokio::spawn({
+        let url = format!("http://127.0.0.1:{port}/api/ask");
+        async move {
+            Http::new()
+                .post(url)
+                .json(&serde_json::json!({
+                    "prompt": "x", "session_id": "streamed", "stream": true, "timeout_secs": 12
+                }))
+                .send()
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let queued = tokio::time::timeout(
+        Duration::from_secs(15),
+        Http::new()
+            .post(format!("http://127.0.0.1:{port}/api/ask"))
+            .json(&serde_json::json!({
+                "prompt": "y", "session_id": "streamed", "timeout_secs": 2
+            }))
+            .send(),
+    )
+    .await
+    .expect("queued caller never got a response")
+    .unwrap();
+
+    assert_eq!(queued.status(), 504);
+    let body: serde_json::Value = queued.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("still running"),
+        "should have blocked on the streaming call's lock, got: {err}"
+    );
+
+    let _ = streamer.await;
+}

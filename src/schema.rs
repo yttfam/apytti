@@ -14,6 +14,7 @@ pub fn backends_schema() -> Value {
                 {"name": "skip_permissions", "type": "bool"},
                 {"name": "allow",            "type": "string[]", "hint": "e.g. Bash(git:*), Read(*)"},
                 {"name": "resume",           "type": "bool",   "default": true},
+                {"name": "timeout_secs",     "type": "number", "hint": "per-call deadline in seconds (default 900)"},
                 {"name": "session_id",       "type": "string", "hint": "default session UUID to resume"}
             ],
             "supports_effort": true,
@@ -29,6 +30,7 @@ pub fn backends_schema() -> Value {
                 {"name": "skip_permissions", "type": "bool",   "hint": "maps to --allow-all"},
                 {"name": "allow",            "type": "string[]", "hint": "tool names, e.g. shell(git)"},
                 {"name": "resume",           "type": "bool",   "default": true},
+                {"name": "timeout_secs",     "type": "number", "hint": "per-call deadline in seconds (default 900)"},
                 {"name": "session_id",       "type": "string"}
             ],
             "supports_effort": true,
@@ -42,6 +44,7 @@ pub fn backends_schema() -> Value {
                 {"name": "dir",              "type": "path"},
                 {"name": "skip_permissions", "type": "bool",   "hint": "maps to --yolo"},
                 {"name": "resume",           "type": "bool",   "default": true},
+                {"name": "timeout_secs",     "type": "number", "hint": "per-call deadline in seconds (default 900)"},
                 {"name": "session_id",       "type": "string", "hint": "session id, 'latest', or index"}
             ],
             "supports_effort": false,
@@ -53,7 +56,8 @@ pub fn backends_schema() -> Value {
                 {"name": "enabled",  "type": "bool"},
                 {"name": "model",    "type": "string", "hint": "llama3.2, mistral:7b, etc."},
                 {"name": "endpoint", "type": "url",    "default": "http://localhost:11434"},
-                {"name": "session_id", "type": "string", "hint": "in-memory session id (lost on restart)"}
+                {"name": "session_id", "type": "string", "hint": "in-memory session id (lost on restart)"},
+                {"name": "timeout_secs", "type": "number", "hint": "per-call deadline in seconds (default 900)"}
             ],
             "supports_effort": false,
             "supports_cost": false,
